@@ -2633,6 +2633,8 @@ fun MeScreen(nav: NavHostController) {
                     AboutLine("记忆闭合", "记忆默认锁住，查看或修改需要两次确认。")
                     AboutLine("数据在本地", "聊天、记忆、图片都存在这台手机上。")
                     AboutLine("Key 加密", "接口密钥由系统 Keystore 加密，按角色分开存。")
+                    AboutLine("作者", "reqinme")
+                    AboutLine("许可", "AI Person 非商业源码开放协议 1.0")
                     Spacer(Modifier.height(6.dp))
                     Text(
                         "AI Person 0.3.1",
