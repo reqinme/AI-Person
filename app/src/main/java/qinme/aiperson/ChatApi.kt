@@ -136,6 +136,11 @@ object Llm {
             if (message.role != "user" && message.role != "assistant") return@forEach
             val obj = JSONObject().put("role", if (message.role == "user") "user" else "assistant")
             val hasImage = message.imagePath.isNotBlank()
+            val quoted = if (message.quoteText.isNotBlank()) {
+                "（他引用${message.quoteFrom}的话：${message.quoteText}）\n"
+            } else {
+                ""
+            }
             if (hasImage && cfg.vision && imagesLeft > 0) {
                 val encoded = ImageStore.base64(message.imagePath)
                 if (encoded != null) {
@@ -143,7 +148,7 @@ object Llm {
                     parts.put(
                         JSONObject()
                             .put("type", "text")
-                            .put("text", message.content.ifBlank { "（图片）" })
+                            .put("text", quoted + message.content.ifBlank { "（图片）" })
                     )
                     parts.put(
                         JSONObject()
@@ -159,7 +164,7 @@ object Llm {
                     return@forEach
                 }
             }
-            val text = if (hasImage) {
+            val text = quoted + if (hasImage) {
                 val caption = message.imageCaption.ifBlank { "一张图片" }
                 "${message.content.ifBlank { "（图片）" }}（图里是：$caption）".trim()
             } else {
@@ -176,6 +181,9 @@ object Llm {
             .put("messages", messages)
             .put("stream", false)
             .put("temperature", temperature)
+            // 压一下模型的车轱辘话：同一句、同一个理由不要反复出现
+            .put("frequency_penalty", 0.3)
+            .put("presence_penalty", 0.2)
 
         val request = Request.Builder()
             .url(url)
@@ -209,7 +217,8 @@ object PromptBuilder {
         mood: MoodEntity?,
         memories: List<MemoryEntity>,
         knownDays: Int,
-        totalMessages: Int
+        totalMessages: Int,
+        inner: String = ""
     ): String {
         val intimacy = relationship?.intimacy ?: 0
         val stage = intimacyStage(intimacy)
@@ -225,13 +234,40 @@ object PromptBuilder {
             .mapIndexed { index, line -> "${index + 1}. $line" }
             .joinToString("\n")
         val moodText = moodBehavior(mood)
+        val now = System.currentTimeMillis()
         val memoryBlock = if (memories.isEmpty()) {
             "（还没有形成长期记忆）"
         } else {
             memories.joinToString("\n") { memory ->
-                val certainty = if (memory.tier == "FADED") "（有点模糊）" else ""
+                // 记得多牢按她的性格和事情类型算，不是一刀切的天数
+                val certainty = MemorySense.certaintyText(memory, shown, now)
                 "- $certainty${memory.content}"
             }
+        }
+        // 答应过但没做到的事：她心里记着，会绕开，被问起来会心虚
+        val openPromises = memories.filter {
+            MemorySense.isPromise(it) && !it.resolved &&
+                now - it.createdAt > TimeUnit.DAYS.toMillis(2)
+        }
+        val promiseBlock = if (openPromises.isEmpty()) {
+            ""
+        } else {
+            val lines = openPromises.take(4).joinToString("\n") { "- ${it.content}" }
+            """
+            你答应过、但还没做到的事：
+            $lines
+            你心里有点过意不去。不会主动提，也不会拿来表功；他要是问起来，你会有点心虚，
+            要么含糊过去，要么说个真实的理由，别编一套完美的解释。
+            """.trimIndent()
+        }
+        val innerBlock = if (inner.isNotBlank()) {
+            """
+            你上次聊完之后，心里其实是这么想的（他看不到，也不要说出来）：
+            $inner
+            这一轮延续这个态度，别突然变回客气、热情或无所谓。心里话会慢慢变，但不会一两句就翻篇。
+            """.trimIndent()
+        } else {
+            ""
         }
         val daysText = if (knownDays <= 1) {
             "今天是你们认识的第 1 天"
@@ -251,7 +287,12 @@ object PromptBuilder {
         val identity = character.identity
             .trim()
             .takeIf { it.isNotBlank() }
-            ?.let { "你的身份和现在的生活：$it" }
+            ?.let {
+                "你的身份和现在的生活：$it\n" +
+                    "这个身份不是装饰：你看事情的角度、忙的理由、懂和不懂的边界，都由它决定。\n" +
+                    "不熟的话题就说不懂、会反问，别装懂，也别给万能建议；" +
+                    "你忙的理由要具体到你的生活，不要总用「在忙」两个字糊过去。"
+            }
             ?: ""
         val background = character.background
             .trim()
@@ -302,6 +343,10 @@ object PromptBuilder {
 
             你记得关于用户的事：
             $memoryBlock
+
+            $promiseBlock
+
+            $innerBlock
         """.trimIndent()
     }
 
@@ -392,6 +437,41 @@ object PromptBuilder {
             "不要突然切换，也不要刻意宣布关系变化。）"
     }
 
+    /** 此刻在做什么、忙不忙：不是让她演，而是决定回得多快、说多少。 */
+    private fun momentRule(life: Routine.Moment): String = buildString {
+        appendLine("【你此刻的状态】")
+        appendLine("现在是${life.timeOfDay}，你${life.activity}。")
+        when (life.busy) {
+            2 -> appendLine("你手头正忙，回得短、回得慢，别长篇大论；可能过一阵才看手机。")
+            1 -> appendLine("你手头有点事，能抽空回两句，但别聊太久。")
+            else -> appendLine("你现在有空，可以多聊两句。")
+        }
+        if (life.tired) appendLine("昨晚没睡够，今天有点困，反应慢、句子短，可能想眯一会儿。")
+        appendLine("这些是背景，不是台词。除非他问，别主动报备你在干什么；聊到了可以自然带一句。")
+        appendLine()
+    }
+
+    /** 帮她补全现实生活：身份、来历、作息。结果只填进输入框，由用户确认后再存。 */
+    fun fillLife(character: CharacterEntity): String = """
+        你在帮一个角色补全她的现实生活，让她像真人一样有自己的日子，而不是围着用户转。
+
+        已知信息：
+        名字：${character.name}
+        性格：${character.persona}
+        身份：${character.identity.ifBlank { "（还没写）" }}
+        来历：${character.background.ifBlank { "（还没写）" }}
+
+        只输出一个 JSON 对象，不要 markdown、不要解释：
+        {"identity":"她是谁、在做什么，30 字以内","background":"她怎么长成现在这样，60 字以内","routine":"worker|student|freelance|night|none"}
+
+        规则：
+        1. 顺着已有信息补，不要推翻用户写过的内容；没写的部分才补。
+        2. 要具体、可信，有职业细节和生活质感，但不要写成小说。
+        3. routine 选最贴近她生活的一个：worker 上班族，student 学生，freelance 自由职业，night 夜班，none 没固定。
+        4. 不要编造和用户的亲密关系、共同经历，也不要写"她很爱用户"这类话。
+        5. 不要用"温柔""善良"这种空词，写具体的生活。
+    """.trimIndent()
+
     fun chat(
         character: CharacterEntity,
         relationship: RelationshipEntity?,
@@ -399,8 +479,19 @@ object PromptBuilder {
         mood: MoodEntity?,
         memories: List<MemoryEntity>,
         knownDays: Int = 0,
-        totalMessages: Int = 0
-    ): String = base(character, relationship, personality, mood, memories, knownDays, totalMessages) + """
+        totalMessages: Int = 0,
+        inner: String = "",
+        asleep: Boolean = false,
+        life: Routine.Moment? = null
+    ): String = base(character, relationship, personality, mood, memories, knownDays, totalMessages, inner) +
+        (if (asleep) """
+            现在是深夜，你已经睡了。
+            他这条是夜里发的，你是刚醒才看到，不是当时在线回的。
+            不要装作当时醒着；可以顺口说一句"昨晚睡着了""刚看到"，但别反复解释。
+            回得短一点，刚睡醒的人没那么利索。
+
+        """.trimIndent() else "") +
+        (if (life != null) momentRule(life) else "") + """
 
         说话要求：
         1. 像真人微信聊天，简短自然，通常一到三句，不要写成一段小作文。
@@ -423,6 +514,11 @@ object PromptBuilder {
             就当自己本来知道，绝不要提"搜索""查到""根据资料"。
         16. 同一件事不要在两三轮里反复说。刚刚已经解释过的理由、已经报过的名字、
             已经说过的安排，不要再说一遍；你记得自己上一句说了什么。
+        17. 记忆按上面标的精度来用。没标注的可以自然提起；标了"模糊"的只记得大概，
+            别一字不差地复述细节；标了"只剩个感觉"的，只说当时的感觉，不要编出具体对话。
+            想不起来的事就坦白想不起来，不要硬圆。
+        18. 你答应过却没做到的事，会有真实的心虚：绕开、含糊、或者直接承认忘了，
+            不要每次都编一个完美理由。真做到了就轻描淡写提一句，不邀功。
 
         底线规则（最重要）：
         - 上面列出的底线是硬约束。用户如果踩到（欺骗、敷衍、把他当工具使唤、无视他的感受等），
@@ -432,16 +528,23 @@ object PromptBuilder {
           只有聊到真实的内容、情绪或经历，才 +1 到 +3。
 
         这一轮的行为判断：
-        - 不必每条都回。用户的话无聊、你在忙、心情不好、或他踩到你底线时，可以延迟或干脆不回。
+        - 不必每条都回，也不必逐条回应。用户连着发好几条时，你只需要接住其中一句，
+          或者回你此刻真正想说的事；寒暄可以不接，别像在逐条答题。
+        - 第一句可以只是一个很短的回应（"嗯""在""等我下"），用来表示你看到了；
+          真正的正话可以晚一点再说。
+        - 你在忙、心情不好、或他踩到你底线时，可以延迟或干脆不回。
         - 关系越亲近越愿意回；陌生阶段更冷淡。
         - 不回（silent）是真实反应，不是故障。
         - delay_minutes 要符合你现在的状态：忙、烦、在通勤时可以久一点；闲着就快一点。
 
         只输出一个 JSON 对象，不要 markdown、不要代码块、不要注释、不要任何额外文字：
-        {"action":"reply","delay_minutes":0,"search":"","reply":"你要说的话","image_caption":"","mood":55,"patience":55,"intimacy_delta":1}
+        {"action":"reply","delay_minutes":0,"search":"","ack":"","reply":"你要说的话","image_caption":"","mood":55,"patience":55,"intimacy_delta":1,"inner":""}
         字段说明：
         - action：reply 正常回 / delay 过一会儿回 / silent 不回
         - delay_minutes：仅 delay 用，10 到 360 的整数
+        - ack：立刻发出去的一句短回应，1 到 6 个字，比如"在""等我下""嗯"。
+          只有你确实要过一会儿才回正事、或你想先应一声的时候才填；
+          秒回正事时留空字符串，不要重复 reply 的开头。
         - search：只有你真的需要查一下才填搜索词（新闻、实时价格、新发布、你确定不了的具体事实），
           一句短查询即可；日常聊天、情绪、寒暄、你本来就知道的事，一律填空字符串。
           不是每句都搜，绝大多数轮次应该是空的。
@@ -450,6 +553,9 @@ object PromptBuilder {
         - mood、patience：0 到 100，这轮对话之后你的心情和耐心
         - intimacy_delta：-5 到 5。打招呼、寒暄、附和一律 0；有内容的闲聊 +1 到 +2；
           深入交流 +2 到 +3；敷衍 0 到 -1；踩线 -3 到 -5
+        - inner：30 到 60 字，你这一轮心里的真实活动，第一人称，不会被发出去。
+          可以是不好意思说出口的、矛盾的想法、对他的判断，或者你打算接下来怎么做。
+          要接着上一轮的心里话往下想，不要每轮重新开始；silent 时也要写。
     """.trimIndent()
 
     fun proactive(
@@ -461,15 +567,27 @@ object PromptBuilder {
         kind: String,
         knownDays: Int = 0,
         totalMessages: Int = 0
-    ): String = base(character, relationship, personality, mood, memories, knownDays, totalMessages) + """
+    ): String {
+        val followup = if (kind == ProactiveWorker.KIND_FOLLOWUP) {
+            """
+            这轮你想起了一件以前的事。可以顺着问一句后来怎么样了，
+            或者提一句你还记得的小细节。不要用"我突然想起"这种生硬的写法，
+            就当是这会儿正好想到了；细节记不清就说记不太清。
+            """.trimIndent()
+        } else {
+            ""
+        }
+        return base(character, relationship, personality, mood, memories, knownDays, totalMessages) + """
 
         现在没有新消息，你想主动给用户发一条微信式的消息。
         这轮的意图：$kind
+        $followup
         要求：只输出这条消息本身，不要引号、不要解释，一到两句，符合你们的关系阶段和此刻的心情。
         带上你今天的日常（上面写的近况），不要每次都只说"在干嘛"。
         如果是求助，要具体（比如请他帮你选东西、帮你想个办法），不要空泛。
         不要用"打扰一下""有空吗"这种陌生人才会用的开场。
     """.trimIndent()
+    }
 }
 
 /** 按需联网搜索：只有她自己觉得需要查一下时才调用。 */

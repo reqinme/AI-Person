@@ -41,7 +41,13 @@ data class CharacterEntity(
     /** 口头禅或固定说法，几句话就够。 */
     @ColumnInfo(defaultValue = "''") val catchphrase: String = "",
     /** 玩梗程度 0-100；越高越爱用网络梗，但不是每句都用。 */
-    @ColumnInfo(defaultValue = "50") val memeLevel: Int = 50
+    @ColumnInfo(defaultValue = "50") val memeLevel: Int = 50,
+    /** 她上一轮心里的真实想法，不会发出去；下一轮用来保持态度连续。 */
+    @ColumnInfo(defaultValue = "''") val innerState: String = "",
+    /** 上面那句心里话是什么时候想的；太久以前的就不当现在用了。 */
+    @ColumnInfo(defaultValue = "0") val innerAt: Long = 0L,
+    /** 生活作息模板：worker / student / freelance / night / none；空表示没设。 */
+    @ColumnInfo(defaultValue = "''") val routine: String = ""
 )
 
 /** 聊天记录。visibleAt > 0 表示延迟消息，到点才显示。role 可为 user / assistant / system / note。 */
@@ -55,7 +61,10 @@ data class MessageEntity(
     val proactive: Boolean = false,
     @ColumnInfo(defaultValue = "''") val imagePath: String = "",
     @ColumnInfo(defaultValue = "''") val imageCaption: String = "",
-    @ColumnInfo(defaultValue = "0") val visibleAt: Long = 0L
+    @ColumnInfo(defaultValue = "0") val visibleAt: Long = 0L,
+    /** 引用回复：被引用那条是谁说的、说了什么；空字符串表示没引用。 */
+    @ColumnInfo(defaultValue = "''") val quoteFrom: String = "",
+    @ColumnInfo(defaultValue = "''") val quoteText: String = ""
 )
 
 /** 长期记忆。tier 为 ACTIVE / FADED，权重衰减到阈值后再删除。 */
@@ -70,7 +79,13 @@ data class MemoryEntity(
     val tier: String = "ACTIVE",
     val pinned: Boolean = false,
     val createdAt: Long,
-    val lastRecalledAt: Long
+    val lastRecalledAt: Long,
+    /** 记忆类型：EMOTION 情绪 / TODO 待办 / PROMISE 承诺 / CHATTER 闲聊；旧数据为空。 */
+    @ColumnInfo(defaultValue = "''") val kind: String = "",
+    /** 被重新提起的次数；提得越多，越不容易忘。 */
+    @ColumnInfo(defaultValue = "0") val mentions: Int = 0,
+    /** 承诺是否已经兑现或作废；兑现在她心里就翻篇了。 */
+    @ColumnInfo(defaultValue = "0") val resolved: Boolean = false
 )
 
 /** 关系状态：亲密度 0-100，阶段由数值推导。 */
@@ -281,7 +296,7 @@ interface MessageDao {
 
 @Dao
 interface MemoryDao {
-    @Query("SELECT * FROM memories WHERE characterId = :characterId ORDER BY pinned DESC, weight DESC, lastRecalledAt DESC LIMIT :limit")
+    @Query("SELECT * FROM memories WHERE characterId = :characterId AND resolved = 0 ORDER BY pinned DESC, weight DESC, lastRecalledAt DESC LIMIT :limit")
     suspend fun recall(characterId: String, limit: Int): List<MemoryEntity>
 
     @Query("SELECT * FROM memories WHERE characterId = :characterId ORDER BY pinned DESC, weight DESC, lastRecalledAt DESC")
@@ -299,8 +314,12 @@ interface MemoryDao {
     @Query("UPDATE memories SET weight = :weight, tier = :tier WHERE id = :id")
     suspend fun updateWeight(id: Long, weight: Float, tier: String)
 
-    @Query("UPDATE memories SET importance = :importance, weight = :weight, lastRecalledAt = :recalledAt WHERE id = :id")
+    @Query("UPDATE memories SET importance = :importance, weight = :weight, lastRecalledAt = :recalledAt, mentions = mentions + 1 WHERE id = :id")
     suspend fun reinforce(id: Long, importance: Int, weight: Float, recalledAt: Long)
+
+    /** 承诺兑现或作废：不再召回，也不再算进“欠着的事”。 */
+    @Query("UPDATE memories SET resolved = 1, weight = 0, tier = 'FADED' WHERE id = :id")
+    suspend fun settle(id: Long)
 
     /** 召回即刷新：这一轮被想起的记忆重新回到满权重，从当下重新开始衰减。 */
     @Query("UPDATE memories SET weight = importance, tier = 'ACTIVE', lastRecalledAt = :at WHERE id IN (:ids)")
@@ -425,7 +444,7 @@ interface MoodDao {
         PersonaChangeEntity::class,
         MoodEntity::class
     ],
-    version = 4,
+    version = 6,
     exportSchema = false
 )
 abstract class AppDatabase : RoomDatabase() {
@@ -512,12 +531,41 @@ abstract class AppDatabase : RoomDatabase() {
             }
         }
 
+        /** 4 -> 5：消息支持引用回复。 */
+        private val MIGRATION_4_5 = object : Migration(4, 5) {
+            override fun migrate(db: androidx.sqlite.db.SupportSQLiteDatabase) {
+                db.execSQL("ALTER TABLE messages ADD COLUMN quoteFrom TEXT NOT NULL DEFAULT ''")
+                db.execSQL("ALTER TABLE messages ADD COLUMN quoteText TEXT NOT NULL DEFAULT ''")
+            }
+        }
+
+        /** 5 -> 6：她有了持续的内心状态，记忆分类型、可被重申、承诺可结算。 */
+        private val MIGRATION_5_6 = object : Migration(5, 6) {
+            override fun migrate(db: androidx.sqlite.db.SupportSQLiteDatabase) {
+                db.execSQL("ALTER TABLE characters ADD COLUMN innerState TEXT NOT NULL DEFAULT ''")
+                db.execSQL("ALTER TABLE characters ADD COLUMN innerAt INTEGER NOT NULL DEFAULT 0")
+                db.execSQL("ALTER TABLE memories ADD COLUMN kind TEXT NOT NULL DEFAULT ''")
+                db.execSQL("ALTER TABLE memories ADD COLUMN mentions INTEGER NOT NULL DEFAULT 0")
+                db.execSQL("ALTER TABLE memories ADD COLUMN resolved INTEGER NOT NULL DEFAULT 0")
+            }
+        }
+
+        /** 6 -> 7：角色有固定生活作息，不再只有睡/醒两态。 */
+        private val MIGRATION_6_7 = object : Migration(6, 7) {
+            override fun migrate(db: androidx.sqlite.db.SupportSQLiteDatabase) {
+                db.execSQL("ALTER TABLE characters ADD COLUMN routine TEXT NOT NULL DEFAULT ''")
+            }
+        }
+
         fun get(context: Context): AppDatabase = instance ?: synchronized(this) {
             instance ?: Room.databaseBuilder(
                 context.applicationContext,
                 AppDatabase::class.java,
                 "ai_person.db"
-            ).addMigrations(MIGRATION_1_2, MIGRATION_2_3, MIGRATION_3_4)
+            ).addMigrations(
+                MIGRATION_1_2, MIGRATION_2_3, MIGRATION_3_4, MIGRATION_4_5,
+                MIGRATION_5_6, MIGRATION_6_7
+            )
                 .fallbackToDestructiveMigration().build().also { instance = it }
         }
     }

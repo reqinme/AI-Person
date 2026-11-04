@@ -165,53 +165,59 @@ object BehaviorSettings {
     const val PROACTIVE_MIN_STAGE = 20
 }
 
-/** 时间规则：延迟上限 6 小时，落在 22:00-08:00 的压到次日 8 点。 */
+/**
+ * 时间规则：她什么时候睡、什么时候醒，按性格和当晚的状态算。
+ * 睡着时消息不会被标成已读，回复也压到醒来。
+ */
 object Timing {
     private const val MAX_DELAY_MINUTES = 360
 
-    fun clampDelay(now: Long, minutes: Int): Long {
-        val target = now + minutes.coerceIn(10, MAX_DELAY_MINUTES) * 60_000L
-        return pushOutOfQuiet(target)
+    /** 上床时间，可能超过 24 点（25 表示凌晨 1 点）。 */
+    fun bedHour(now: Long, characterId: String, shown: PersonalityEntity, routine: String): Int {
+        if (routine == Routine.NIGHT) return Routine.baseBed(now, routine).toInt() % 24
+        val late = ((shown.liveliness - 50) / 50f).coerceIn(-1f, 1f)
+        val independent = ((shown.independence - 50) / 50f).coerceIn(-1f, 1f)
+        val wild = if (Routine.staysUpLate(now, characterId, shown, routine)) 1.5f else 0f
+        val base = Routine.baseBed(now, routine) + late * 1.2f + independent * 0.6f + wild
+        return Math.round(base.coerceIn(21.5f, 26f)) % 24
     }
 
-    /** 按性格的短延迟，几秒到二十分钟，不强制十分钟起步。 */
-    fun shortDelay(now: Long, minutes: Int): Long {
-        val target = now + minutes.coerceIn(0, 20) * 60_000L
-        // 人还醒着，只是这几分钟跨进了静默点：压在静默前回，不要拖到第二天早上
-        if (!inQuietHours(now) && inQuietHours(target)) {
-            val cal = java.util.Calendar.getInstance().apply {
-                timeInMillis = now
-                set(java.util.Calendar.HOUR_OF_DAY, BehaviorSettings.QUIET_START_HOUR)
-                set(java.util.Calendar.MINUTE, 0)
-                set(java.util.Calendar.SECOND, 0)
-                set(java.util.Calendar.MILLISECOND, 0)
-            }
-            val before = cal.timeInMillis - 60_000L
-            if (before > now) return before
-        }
-        return pushOutOfQuiet(target)
+    /** 醒来时间；熬夜的第二天会晚一点。 */
+    fun wakeHour(now: Long, characterId: String, shown: PersonalityEntity, routine: String): Int {
+        if (routine == Routine.NIGHT) return Routine.baseWake(now, routine)
+        val late = ((shown.liveliness - 50) / 50f).coerceIn(-1f, 1f)
+        val wild = if (Routine.staysUpLate(now, characterId, shown, routine)) 1f else 0f
+        return Math.round((Routine.baseWake(now, routine).toFloat() + late * 1.2f + wild).coerceIn(6f, 10f))
     }
 
-    fun pushOutOfQuiet(ts: Long): Long {
-        val cal = java.util.Calendar.getInstance().apply { timeInMillis = ts }
-        val hour = cal.get(java.util.Calendar.HOUR_OF_DAY)
-        if (hour >= BehaviorSettings.QUIET_START_HOUR || hour < BehaviorSettings.QUIET_END_HOUR) {
-            if (hour >= BehaviorSettings.QUIET_START_HOUR) {
-                cal.add(java.util.Calendar.DAY_OF_YEAR, 1)
-            }
-            cal.set(java.util.Calendar.HOUR_OF_DAY, BehaviorSettings.QUIET_END_HOUR)
-            cal.set(java.util.Calendar.MINUTE, 0)
-            cal.set(java.util.Calendar.SECOND, 0)
-            cal.set(java.util.Calendar.MILLISECOND, 0)
-            return cal.timeInMillis
-        }
-        return ts
-    }
-
-    fun inQuietHours(now: Long): Boolean {
+    fun isAsleep(now: Long, characterId: String, shown: PersonalityEntity, routine: String): Boolean {
+        val bed = bedHour(now, characterId, shown, routine)
+        val wake = wakeHour(now, characterId, shown, routine)
         val hour = java.util.Calendar.getInstance()
             .apply { timeInMillis = now }
             .get(java.util.Calendar.HOUR_OF_DAY)
-        return hour >= BehaviorSettings.QUIET_START_HOUR || hour < BehaviorSettings.QUIET_END_HOUR
+        return if (bed < wake) hour >= bed && hour < wake else hour >= bed || hour < wake
     }
+
+    /** 下一次醒来；睡着时所有回复都压到这个点。 */
+    fun nextWake(now: Long, characterId: String, shown: PersonalityEntity, routine: String): Long {
+        val cal = java.util.Calendar.getInstance().apply {
+            timeInMillis = now
+            set(java.util.Calendar.HOUR_OF_DAY, wakeHour(now, characterId, shown, routine))
+            set(java.util.Calendar.MINUTE, 0)
+            set(java.util.Calendar.SECOND, 0)
+            set(java.util.Calendar.MILLISECOND, 0)
+        }
+        if (cal.timeInMillis <= now) cal.add(java.util.Calendar.DAY_OF_YEAR, 1)
+        return cal.timeInMillis
+    }
+
+    fun clampDelay(now: Long, minutes: Int): Long {
+        val target = now + minutes.coerceIn(10, MAX_DELAY_MINUTES) * 60_000L
+        return target
+    }
+
+    /** 按性格的短延迟，几秒到二十分钟，不强制十分钟起步。 */
+    fun shortDelay(now: Long, minutes: Int): Long =
+        now + minutes.coerceIn(0, 20) * 60_000L
 }

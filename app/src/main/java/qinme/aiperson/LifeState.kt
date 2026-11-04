@@ -84,19 +84,22 @@ object LifeState {
         "今天在网上看到一个说法，觉得挺对，又觉得挺矫情"
     )
 
-    /** 今天过得怎么样，全天固定一句。 */
+    /** 今天过得怎么样，全天固定一句；还没到的时段不会提前说。 */
     fun today(characterId: String, ts: Long = System.currentTimeMillis()): String {
         val cal = Calendar.getInstance().apply { timeInMillis = ts }
         val weekend = isWeekend(cal)
-        val pool = if (weekend) {
-            morningWeekend + noonWeekend + afternoonWeekend + eveningWeekend + netPool
-        } else {
-            morningWeekday + noonWeekday + afternoonWeekday + eveningWeekday + netPool
+        val hour = cal.get(Calendar.HOUR_OF_DAY)
+        val pool = buildList {
+            addAll(if (weekend) morningWeekend else morningWeekday)
+            if (hour >= 11) addAll(if (weekend) noonWeekend else noonWeekday)
+            if (hour >= 14) addAll(if (weekend) afternoonWeekend else afternoonWeekday)
+            if (hour >= 18) addAll(if (weekend) eveningWeekend else eveningWeekday)
+            addAll(netPool)
         }
         return pick(key(characterId, ts, "today", weekend), pool)
     }
 
-    /** 这个时段她正在做什么。 */
+    /** 这个时段她正在做什么。状态四个小时一换，不会十几分钟就换一件事。 */
     fun now(characterId: String, ts: Long = System.currentTimeMillis()): String {
         val cal = Calendar.getInstance().apply { timeInMillis = ts }
         val weekend = isWeekend(cal)
@@ -109,7 +112,7 @@ object LifeState {
             hour < 23 -> if (weekend) eveningWeekend else eveningWeekday
             else -> night
         }
-        return pick(key(characterId, ts, "now", weekend, hour / 3), pool)
+        return pick(key(characterId, ts, "now", weekend, hour / 4), pool)
     }
 
     private fun isWeekend(cal: Calendar): Boolean {

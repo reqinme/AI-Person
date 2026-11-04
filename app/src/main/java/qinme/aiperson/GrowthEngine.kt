@@ -16,22 +16,31 @@ object GrowthEngine {
     private const val EVAL_PROMPT = """你是一个记忆整理器。阅读下面这段最近的对话，输出长期记忆和人格变化。
 
     只输出一个 JSON 对象，不要 markdown、不要注释、不要多余文字：
-    {"memories":[{"content":"关于用户或这段关系的一句事实，第三人称，20 字以内","importance":1,"tag":""}],"personality":{"warmth":0,"liveliness":0,"initiative":0,"independence":0,"clinginess":0},"persona":{"change":"","reason":"","nickname":""}}
+    {"memories":[{"content":"关于用户或这段关系的一句事实，第三人称，20 字以内","importance":1,"kind":"EMOTION","tag":""}],"settled":[],"personality":{"warmth":0,"liveliness":0,"initiative":0,"independence":0,"clinginess":0},"persona":{"change":"","reason":"","nickname":""}}
 
     规则：
     1. memories 只写值得长期记住的事（偏好、经历、重要的人、承诺、底线），最多 4 条；没有就给空数组。
     2. importance 取 1 到 5，越重要越高；寒暄、天气、一次性小事不要记。
-    3. personality 的每项是 -2 到 2 的变化量，代表这段对话把人设往哪个方向推了一点点；没有明显变化就给 0。
-    4. 不要复述整段对话，不要写"用户说了…"这种流水账。
-    5. tag 默认为空字符串。如果这段对话里出现了她反感、讨厌的事，或者用户明确说过讨厌什么，
+       用户明确说过「这个很重要」「一定要记住」的，importance 给 5。
+    3. kind 必须选一个：
+       EMOTION 他的情绪、雷区、在意的事、喜欢或讨厌什么；
+       TODO 具体安排（几点、在哪、带什么、记得做什么）；
+       PROMISE 承诺——她说要做的、他托付她的事、双方约定；
+       CHATTER 闲聊碎片、八卦、一次性的小事。
+    4. personality 的每项是 -2 到 2 的变化量，代表这段对话把人设往哪个方向推了一点点；没有明显变化就给 0。
+    5. 不要复述整段对话，不要写"用户说了…"这种流水账。
+    6. tag 默认为空字符串。如果这段对话里出现了她反感、讨厌的事，或者用户明确说过讨厌什么，
        把这条写成软印象，tag 填 "dislike"，内容写成「用户讨厌…」或「她不喜欢…」。
        不要照抄角色设定里的硬底线，只记录这段对话里自然浮现的、具体的好恶。
-    6. 变化必须延续她的底色，不能突然换成另一种性格。比如底色偏冷的人，最多只是对这个人稍微软了一点。
-    7. persona.change：如果这段相处真的让她有了一点点变化，用一句第三人称写"她变成什么样"，
+    7. 变化必须延续她的底色，不能突然换成另一种性格。比如底色偏冷的人，最多只是对这个人稍微软了一点。
+    8. persona.change：如果这段相处真的让她有了一点点变化，用一句第三人称写"她变成什么样"，
        不要写数字、不要写成总结报告；没有变化就留空字符串。
-    8. persona.reason 用一句很短的话说明为什么会变，比如"被认真回应过"。
-    9. persona.nickname：只有关系已经亲近、她对用户的称呼自然变了时才填新称呼（比如"阿哲"），
-       否则留空。不要为了显得亲近而编造。"""
+    9. persona.reason 用一句很短的话说明为什么会变，比如"被认真回应过"。
+    10. persona.nickname：只有关系已经亲近、她对用户的称呼自然变了时才填新称呼（比如"阿哲"），
+        否则留空。不要为了显得亲近而编造。
+    11. settled：下面是"她答应过、但还没做到的事"。如果这段对话里已经兑现、明确作废、
+        或者双方都不再提了，把那条的原文放进 settled 数组（原样照抄，别改写）；没变化就给空数组。
+        不要凭空把没解决的事写进 settled。"""
 
     suspend fun maybeGrow(characterId: String) = withContext(Dispatchers.IO) {
         val db = AppGraph.db
@@ -64,6 +73,13 @@ object GrowthEngine {
             return@withContext
         }
 
+        val openPromises = db.memoryDao().list(characterId)
+            .filter {
+                MemorySense.isPromise(it) && !it.resolved &&
+                    System.currentTimeMillis() - it.createdAt > TimeUnit.DAYS.toMillis(2)
+            }
+            .take(6)
+
         val head = buildString {
             appendLine("角色：${character.name}")
             appendLine("人设：${character.persona}")
@@ -76,6 +92,11 @@ object GrowthEngine {
             }
             if (character.nickname.isNotBlank()) appendLine("她现在叫他：${character.nickname}")
             appendLine("当前心情：${mood?.mood ?: 55}/100")
+            if (openPromises.isNotEmpty()) {
+                appendLine()
+                appendLine("她答应过、但还没做到的事（用于判断 settled）：")
+                openPromises.forEach { appendLine("- ${it.content}") }
+            }
             appendLine()
             appendLine("最近对话：")
             appendLine(transcript.take(3000))
@@ -107,6 +128,7 @@ object GrowthEngine {
         }
 
         writeMemories(characterId, json)
+        settlePromises(characterId, json)
         evolvePersonality(characterId, character, personality, json)
         BehaviorSettings.setLastEvalId(characterId, latest)
         MemoryDecay.run(characterId)
@@ -124,6 +146,10 @@ object GrowthEngine {
             if (content.length < 2) continue
             val importance = item.optInt("importance", 3).coerceIn(1, 5)
             val tags = if (item.optString("tag", "").trim() == "dislike") "dislike" else ""
+            val kind = MemorySense.normalizeKind(
+                item.optString("kind", "").trim(),
+                content
+            )
 
             val matched = existing.firstOrNull { sameMemory(it.content, content) }
             if (matched != null) {
@@ -139,10 +165,25 @@ object GrowthEngine {
                         tags = tags,
                         weight = importance.toFloat(),
                         createdAt = now,
-                        lastRecalledAt = now
+                        lastRecalledAt = now,
+                        kind = kind
                     )
                 )
             }
+        }
+    }
+
+    /** 兑现或作废的承诺不再召回；她心里那件事翻篇了。 */
+    private suspend fun settlePromises(characterId: String, json: JSONObject) {
+        val array = json.optJSONArray("settled") ?: return
+        if (array.length() == 0) return
+        val dao = AppGraph.db.memoryDao()
+        val open = dao.list(characterId).filter { MemorySense.isPromise(it) && !it.resolved }
+        for (i in 0 until array.length()) {
+            val text = array.optString(i, "").trim()
+            if (text.length < 2) continue
+            val matched = open.firstOrNull { sameMemory(it.content, text) } ?: continue
+            dao.settle(matched.id)
         }
     }
 
@@ -382,6 +423,88 @@ object GrowthEngine {
     }
 }
 
+/**
+ * 她记得多牢，由「这件事是什么类型」×「她是什么人」一起决定。
+ * 不是随机遗忘，也不是一律按天数；同样一句闲聊，活泼的人记很久，清冷的人转眼就忘。
+ */
+object MemorySense {
+    const val KIND_EMOTION = "EMOTION"
+    const val KIND_TODO = "TODO"
+    const val KIND_PROMISE = "PROMISE"
+    const val KIND_CHATTER = "CHATTER"
+
+    private val KINDS = setOf(KIND_EMOTION, KIND_TODO, KIND_PROMISE, KIND_CHATTER)
+
+    fun isPromise(memory: MemoryEntity): Boolean =
+        memory.kind == KIND_PROMISE ||
+            (memory.kind.isBlank() && memory.content.contains("答应"))
+
+    /** 模型给的 kind 不在枚举里时，按内容猜一个，别让旧数据全部变成同一种。 */
+    fun normalizeKind(raw: String, content: String): String {
+        val value = raw.uppercase()
+        if (value in KINDS) return value
+        return when {
+            content.contains("答应") || content.contains("承诺") || content.contains("说好") ->
+                KIND_PROMISE
+            content.contains("提醒") || content.contains("别忘") || content.contains("几点") ||
+                content.contains("记得带") || content.contains("约好") -> KIND_TODO
+            content.contains("讨厌") || content.contains("喜欢") || content.contains("在意") ||
+                content.contains("害怕") || content.contains("雷区") -> KIND_EMOTION
+            else -> KIND_CHATTER
+        }
+    }
+
+    /**
+     * 每天折合多少「记忆天数」：大于 1 忘得快，小于 1 记得牢。
+     * 温暖的人记情绪，独立的人记安排，黏人的人记关于他的事，活泼的人记闲话。
+     */
+    fun forgettingSpeed(
+        shown: PersonalityEntity,
+        kind: String,
+        pinned: Boolean,
+        mentions: Int
+    ): Float {
+        if (pinned) return 0.15f
+        val w = (shown.warmth - 50) / 50f
+        val l = (shown.liveliness - 50) / 50f
+        val i = (shown.independence - 50) / 50f
+        val c = (shown.clinginess - 50) / 50f
+        val base = when (kind) {
+            KIND_EMOTION -> 0.55f - 0.35f * w - 0.20f * c
+            KIND_TODO -> 1.10f + 0.30f * l + 0.35f * i - 0.15f * w
+            KIND_PROMISE -> 0.85f - 0.35f * i + 0.20f * w
+            KIND_CHATTER -> 1.45f - 0.35f * l + 0.15f * i
+            else -> 1.0f
+        }
+        // 被重新提起过的，印象回深一点
+        val repeat = mentions.coerceAtMost(5) * 0.12f
+        return (base - repeat).coerceIn(0.15f, 3f)
+    }
+
+    /**
+     * 提示词里的精度标注：清楚 → 有点模糊 → 细节糊了 → 只剩感觉。
+     * 用户说过「很重要」的事，最多糊到「有这回事」，不会只剩感觉。
+     */
+    fun certaintyText(memory: MemoryEntity, shown: PersonalityEntity, now: Long): String {
+        if (memory.pinned) return ""
+        val days = ((now - memory.createdAt) / 86_400_000L).toFloat().coerceAtLeast(0f)
+        val felt = days * forgettingSpeed(shown, memory.kind, memory.pinned, memory.mentions)
+        val level = when {
+            felt >= 45f -> 3
+            felt >= 15f -> 2
+            felt >= 6f -> 1
+            else -> 0
+        }
+        if (level == 3 && memory.importance >= 5) return "（记得有这回事，细节有点糊）"
+        return when (level) {
+            1 -> "（有点模糊）"
+            2 -> "（记得有这回事，细节有点糊）"
+            3 -> "（只剩个大概的感觉了，具体说了什么记不清）"
+            else -> ""
+        }
+    }
+}
+
 /** 记忆衰减：半衰期 14 天，低于 2 变模糊，低于 0.5 且 30 天未回忆才删除；钉住的不衰减。 */
 object MemoryDecay {
     suspend fun run(characterId: String? = null) = withContext(Dispatchers.IO) {
@@ -395,6 +518,10 @@ object MemoryDecay {
 
         characters.forEach { character ->
             val dao = db.memoryDao()
+            val personality = db.personalityDao().get(character.id)
+                ?: PersonalityEntity(characterId = character.id)
+            val intimacy = db.relationshipDao().get(character.id)?.intimacy ?: 0
+            val shown = effectivePersonality(personality, intimacy)
             val memories = dao.list(character.id)
             memories.forEach { memory ->
                 if (memory.pinned) {
@@ -402,8 +529,10 @@ object MemoryDecay {
                     return@forEach
                 }
                 val days = (now - memory.lastRecalledAt).toFloat() / TimeUnit.DAYS.toMillis(1).toFloat()
+                // 忘得多快按她的性格和这件事的类型算，不再所有人一个半衰期
+                val speed = MemorySense.forgettingSpeed(shown, memory.kind, memory.pinned, memory.mentions)
                 val weight = memory.importance.toFloat() *
-                    0.5f.pow(days / BehaviorSettings.HALF_LIFE_DAYS.toFloat())
+                    0.5f.pow(days * speed / BehaviorSettings.HALF_LIFE_DAYS.toFloat())
                 val tier = if (weight >= BehaviorSettings.DEGRADE_THRESHOLD) "ACTIVE" else "FADED"
                 dao.updateWeight(memory.id, weight, tier)
             }

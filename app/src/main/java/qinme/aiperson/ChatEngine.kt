@@ -39,10 +39,20 @@ object ChatEngine {
         val patience: Int?,
         val intimacyDelta: Int,
         /** 她这一轮想查的东西；空字符串表示不用查。 */
-        val search: String = ""
+        val search: String = "",
+        /** 立刻发出去的一句短回应，比如"在""等我下"；空字符串表示不先应声。 */
+        val ack: String = "",
+        /** 她这一轮没说出口的心里话，留着给下一轮接上态度。 */
+        val inner: String = ""
     )
 
-    suspend fun send(characterId: String, text: String, imageName: String = ""): Result =
+    suspend fun send(
+        characterId: String,
+        text: String,
+        imageName: String = "",
+        quoteFrom: String = "",
+        quoteText: String = ""
+    ): Result =
         withContext(Dispatchers.IO) {
             val db = AppGraph.db
             val now = System.currentTimeMillis()
@@ -54,7 +64,9 @@ object ChatEngine {
                     role = "user",
                     content = text.trim(),
                     createdAt = now,
-                    imagePath = imageName
+                    imagePath = imageName,
+                    quoteFrom = quoteFrom.take(60),
+                    quoteText = quoteText.take(200)
                 )
             )
             db.relationshipDao().upsert(relationship.copy(lastChatAt = now))
@@ -107,6 +119,19 @@ object ChatEngine {
             val knownDays = ((now - character.createdAt) / TimeUnit.DAYS.toMillis(1)).toInt() + 1
             val totalMessages = db.messageDao().countDialogue(characterId)
 
+            // 上一轮没说出口的心里话：太久以前的不当现在用，免得她卡在几天前的情绪里
+            val inner = character.innerState.trim().take(80).takeIf {
+                it.isNotBlank() && now - character.innerAt <= TimeUnit.HOURS.toMillis(24)
+            }.orEmpty()
+
+            // 她这会儿是不是睡着了：睡了就不读、不回，等醒了再说
+            val shownNow = effectivePersonality(personality, relationship.intimacy)
+            val routine = character.routine
+            val asleep = Timing.isAsleep(now, character.id, shownNow, routine)
+            val wakeAt = if (asleep) Timing.nextWake(now, character.id, shownNow, routine) else 0L
+            // 此刻在做什么、忙不忙、昨晚睡够没有
+            val life = Routine.moment(now, character.id, shownNow, routine)
+
             val system = PromptBuilder.chat(
                 character,
                 relationship,
@@ -114,7 +139,10 @@ object ChatEngine {
                 mood,
                 memories,
                 knownDays,
-                totalMessages
+                totalMessages,
+                inner,
+                asleep,
+                life
             )
 
             val raw = try {
@@ -151,6 +179,13 @@ object ChatEngine {
                 db.messageDao().setCaption(messageId, decision.caption.take(120))
             }
 
+            // 心里话只存下来，不发给用户；下一轮用它保持态度连续
+            if (decision.inner.isNotBlank()) {
+                db.characterDao().upsert(
+                    character.copy(innerState = decision.inner.take(80), innerAt = now)
+                )
+            }
+
             // 心情有惯性：新心情 = 旧 70% + 这一轮 30%；刚吵完的 2-3 轮里只能往下，不能立刻回血
             val hold = BehaviorSettings.moodHold(characterId)
             val blendedMood = Math.round(mood.mood * 0.7f + (decision.mood ?: mood.mood) * 0.3f)
@@ -185,28 +220,47 @@ object ChatEngine {
 
             val smallTalk = isSmallTalk(text, imageName.isNotBlank())
             val shown = effectivePersonality(personality, intimacy)
+            val baseDelay = naturalDelayMinutes(shown, nextMoodValue, intimacy, smallTalk)
+            // 上班/上课时回得慢，困的时候也拖；正忙时至少隔几分钟再回
+            val naturalDelay = Math.round(
+                baseDelay * Routine.delayFactor(now, character.routine, life.tired)
+            ).let { if (life.busy == 2 && it == 0) 4 else it }
+
+            // 她要过一会儿才说正事时，先秒回一个"在""等我下"，别让人干等
+            // 但睡着了就不能先应声——人睡着时不会回"等我下"
+            val waits = decision.action == "delay" ||
+                (decision.action == "reply" && naturalDelay > 0)
+            if (!asleep && waits && decision.ack.isNotBlank() &&
+                !decision.reply.startsWith(decision.ack)
+            ) {
+                insertReply(characterId, decision.ack, System.currentTimeMillis(), notify = false)
+            }
 
             when (decision.action) {
                 "silent" -> {
                     // 空的隐藏占位，仅用于推断「已读」，UI 不显示
+                    // 睡着时不产生已读：占位排到醒来，醒来才看到
                     db.messageDao().insert(
                         MessageEntity(
                             characterId = characterId,
                             role = "note",
                             content = "",
-                            createdAt = now
+                            createdAt = now,
+                            visibleAt = if (asleep) wakeAt else 0L
                         )
                     )
                 }
 
                 "delay" -> {
-                    val target = Timing.clampDelay(now, decision.delayMinutes)
+                    val target = maxOf(Timing.clampDelay(now, decision.delayMinutes), wakeAt)
                     db.messageDao().insert(
                         MessageEntity(
                             characterId = characterId,
                             role = "note",
-                            content = "她看到了，过一会儿回",
-                            createdAt = now + 1
+                            // 睡着时不写"她看到了"，那条消息她其实还没看到
+                            content = if (asleep) "" else "她看到了，过一会儿回",
+                            createdAt = if (asleep) wakeAt else now + 1,
+                            visibleAt = if (asleep) wakeAt else 0L
                         )
                     )
                     insertReply(characterId, decision.reply, target, notify = true)
@@ -214,8 +268,10 @@ object ChatEngine {
 
                 else -> {
                     val reply = decision.reply.ifBlank { "……" }
-                    val naturalDelay = naturalDelayMinutes(shown, nextMoodValue, intimacy, smallTalk)
-                    if (naturalDelay > 0) {
+                    if (asleep) {
+                        // 睡了就不标已读、不秒回，睡醒再回
+                        insertReply(characterId, reply, wakeAt, notify = true)
+                    } else if (naturalDelay > 0) {
                         // 按性格慢半拍：清冷、忙、心情差的时候不会秒回
                         val target = Timing.shortDelay(now, naturalDelay)
                         db.messageDao().insert(
@@ -392,11 +448,21 @@ object ChatEngine {
         val delta = json.optInt("intimacy_delta", 1).coerceIn(-5, 5)
         val minutes = json.optInt("delay_minutes", 15)
         val search = json.optString("search", "").trim().take(120)
+        val ack = json.optString("ack", "")
+            .replace("\n", " ")
+            .trim()
+            .trim('"')
+            .take(12)
+        val inner = json.optString("inner", "")
+            .replace("\n", " ")
+            .trim()
+            .trim('"')
+            .take(80)
 
         return if (action == "reply" && reply.isBlank()) {
-            Decision("silent", 0, "", caption, mood, patience, delta, search)
+            Decision("silent", 0, "", caption, mood, patience, delta, search, inner = inner)
         } else {
-            Decision(action, minutes, reply, caption, mood, patience, delta, search)
+            Decision(action, minutes, reply, caption, mood, patience, delta, search, ack, inner)
         }
     }
 

@@ -1,7 +1,10 @@
 package qinme.aiperson
 
 import android.Manifest
+import android.content.ClipData
+import android.content.ClipboardManager
 import android.content.Context
+import android.content.Intent
 import android.net.Uri
 import android.widget.Toast
 import androidx.activity.compose.rememberLauncherForActivityResult
@@ -11,6 +14,7 @@ import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.foundation.layout.*
@@ -42,6 +46,7 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalLifecycleOwner
@@ -65,6 +70,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import org.json.JSONObject
 import java.io.File
 import java.text.SimpleDateFormat
 import java.util.Calendar
@@ -1219,6 +1225,9 @@ fun ChatScreen(nav: NavHostController, characterId: String) {
     var showPlus by remember { mutableStateOf(false) }
     var previewImage by remember { mutableStateOf<String?>(null) }
     var flashId by remember { mutableStateOf<Long?>(null) }
+    var actionMessage by remember { mutableStateOf<MessageEntity?>(null) }
+    var quoteFrom by remember { mutableStateOf("") }
+    var quoteText by remember { mutableStateOf("") }
     var nowTick by remember { mutableLongStateOf(System.currentTimeMillis()) }
     var announced by remember { mutableStateOf(setOf<Long>()) }
     var announcedReady by remember { mutableStateOf(false) }
@@ -1294,11 +1303,11 @@ fun ChatScreen(nav: NavHostController, characterId: String) {
         }
     }
 
-    fun deliver(text: String, image: String) {
+    fun deliver(text: String, image: String, from: String, quoted: String) {
         scope.launch {
             sending = true
             try {
-                ChatEngine.send(characterId, text, image)
+                ChatEngine.send(characterId, text, image, from, quoted)
             } finally {
                 sending = false
             }
@@ -1310,10 +1319,14 @@ fun ChatScreen(nav: NavHostController, characterId: String) {
         val text = input.trim()
         val image = selectedImage
         if (text.isEmpty() && image.isEmpty()) return
+        val from = quoteFrom
+        val quoted = quoteText
         input = ""
         selectedImage = ""
+        quoteFrom = ""
+        quoteText = ""
         showPlus = false
-        deliver(text, image)
+        deliver(text, image, from, quoted)
     }
 
     Box(Modifier.fillMaxSize()) {
@@ -1353,7 +1366,8 @@ fun ChatScreen(nav: NavHostController, characterId: String) {
                             isRead = message.id in readIds,
                             highlighted = flashId == message.id,
                             accent = accent,
-                            onImageClick = { previewImage = it }
+                            onImageClick = { previewImage = it },
+                            onLongPress = { actionMessage = it }
                         )
                     }
                 }
@@ -1370,6 +1384,26 @@ fun ChatScreen(nav: NavHostController, characterId: String) {
                         takePhoto()
                     }
                 )
+            }
+
+            if (quoteText.isNotBlank()) {
+                Row(
+                    Modifier
+                        .fillMaxWidth()
+                        .background(c.bar.copy(alpha = 0.94f))
+                        .padding(horizontal = 14.dp, vertical = 4.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Text(
+                        "引用 $quoteFrom：$quoteText",
+                        fontSize = 12.sp,
+                        color = c.muted,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                        modifier = Modifier.weight(1f)
+                    )
+                    TextButton(onClick = { quoteFrom = ""; quoteText = "" }) { Text("取消") }
+                }
             }
 
             if (selectedImage.isNotBlank()) {
@@ -1477,6 +1511,70 @@ fun ChatScreen(nav: NavHostController, characterId: String) {
             }
         )
     }
+
+    val target = actionMessage
+    if (target != null) {
+        val from = if (target.role == "user") "我" else character?.name ?: "她"
+        val body = target.content.ifBlank { "（图片）" }
+        MessageActions(
+            excerpt = body,
+            onDismiss = { actionMessage = null },
+            onCopy = {
+                copyMessage(context, body)
+                actionMessage = null
+            },
+            onShare = {
+                shareMessage(context, body)
+                actionMessage = null
+            },
+            onQuote = {
+                quoteFrom = from
+                quoteText = body.take(200)
+                actionMessage = null
+            }
+        )
+    }
+}
+
+/** 长按消息后的操作：复制、转发到别的应用、引用回复。 */
+@Composable
+private fun MessageActions(
+    excerpt: String,
+    onDismiss: () -> Unit,
+    onCopy: () -> Unit,
+    onShare: () -> Unit,
+    onQuote: () -> Unit
+) {
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("消息") },
+        text = {
+            Column {
+                Text(excerpt, maxLines = 3, overflow = TextOverflow.Ellipsis, fontSize = 13.sp)
+                Spacer(Modifier.height(8.dp))
+                Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                    TextButton(onClick = onCopy) { Text("复制") }
+                    TextButton(onClick = onShare) { Text("转发") }
+                    TextButton(onClick = onQuote) { Text("引用") }
+                }
+            }
+        },
+        confirmButton = { TextButton(onClick = onDismiss) { Text("取消") } }
+    )
+}
+
+private fun copyMessage(context: Context, text: String) {
+    val clipboard = context.getSystemService(ClipboardManager::class.java)
+    clipboard?.setPrimaryClip(ClipData.newPlainText("AI Person", text))
+    Toast.makeText(context, "已复制", Toast.LENGTH_SHORT).show()
+}
+
+private fun shareMessage(context: Context, text: String) {
+    val intent = Intent(Intent.ACTION_SEND).apply {
+        type = "text/plain"
+        putExtra(Intent.EXTRA_TEXT, text)
+    }
+    context.startActivity(Intent.createChooser(intent, "转发到"))
 }
 
 /** 聊天背景：默认雾面渐变；有角色背景图则用图 + 轻微模糊。 */
@@ -1557,7 +1655,8 @@ private fun MessageRow(
     isRead: Boolean,
     highlighted: Boolean,
     accent: Color,
-    onImageClick: (String) -> Unit
+    onImageClick: (String) -> Unit,
+    onLongPress: (MessageEntity) -> Unit
 ) {
     val c = weChatColors()
     val context = LocalContext.current
@@ -1606,17 +1705,26 @@ private fun MessageRow(
                 }
                 if (message.content.isNotBlank()) {
                     val shape = RoundedCornerShape(topStart = 16.dp, topEnd = 4.dp, bottomStart = 16.dp, bottomEnd = 16.dp)
-                    Text(
-                        message.content,
-                        modifier = Modifier
+                    Column(
+                        Modifier
                             .widthIn(max = 270.dp)
                             .clip(shape)
                             .background(c.bubbleSelf.copy(alpha = 0.78f))
                             .then(if (highlighted) Modifier.border(2.dp, accent, shape) else Modifier)
-                            .padding(horizontal = 12.dp, vertical = 9.dp),
-                        style = MaterialTheme.typography.bodyMedium,
-                        color = c.selfText
-                    )
+                            .pointerInput(message.id) {
+                                detectTapGestures(onLongPress = { onLongPress(message) })
+                            }
+                            .padding(horizontal = 12.dp, vertical = 9.dp)
+                    ) {
+                        if (message.quoteText.isNotBlank()) {
+                            QuotedLine(message.quoteFrom, message.quoteText, c)
+                        }
+                        Text(
+                            message.content,
+                            style = MaterialTheme.typography.bodyMedium,
+                            color = c.selfText
+                        )
+                    }
                 }
                 Row(
                     Modifier.padding(top = 3.dp, end = 2.dp),
@@ -1656,16 +1764,25 @@ private fun MessageRow(
                     )
                 }
                 val shape = RoundedCornerShape(topStart = 4.dp, topEnd = 16.dp, bottomStart = 16.dp, bottomEnd = 16.dp)
-                Text(
-                    message.content.ifBlank { "……" },
-                    modifier = Modifier
+                Column(
+                    Modifier
                         .clip(shape)
                         .background(c.bubbleOther.copy(alpha = 0.78f))
                         .then(if (highlighted) Modifier.border(2.dp, accent, shape) else Modifier)
-                        .padding(horizontal = 12.dp, vertical = 9.dp),
-                    style = MaterialTheme.typography.bodyMedium,
-                    color = c.text
-                )
+                        .pointerInput(message.id) {
+                            detectTapGestures(onLongPress = { onLongPress(message) })
+                        }
+                        .padding(horizontal = 12.dp, vertical = 9.dp)
+                ) {
+                    if (message.quoteText.isNotBlank()) {
+                        QuotedLine(message.quoteFrom, message.quoteText, c)
+                    }
+                    Text(
+                        message.content.ifBlank { "……" },
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = c.text
+                    )
+                }
                 Row(Modifier.padding(top = 3.dp, start = 2.dp), verticalAlignment = Alignment.CenterVertically) {
                     Text(
                         timeText(message.visibleAt.takeIf { it > 0 } ?: message.createdAt),
@@ -1676,6 +1793,24 @@ private fun MessageRow(
             }
         }
     }
+}
+
+@Composable
+private fun QuotedLine(from: String, text: String, c: WeChatColors) {
+    val who = if (from.isBlank()) "" else "$from："
+    Text(
+        who + text,
+        fontSize = 11.sp,
+        color = c.muted,
+        maxLines = 2,
+        overflow = TextOverflow.Ellipsis,
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(bottom = 6.dp)
+            .clip(RoundedCornerShape(6.dp))
+            .background(c.text.copy(alpha = 0.07f))
+            .padding(horizontal = 6.dp, vertical = 4.dp)
+    )
 }
 
 @Composable
@@ -2100,6 +2235,8 @@ fun CharacterSettingsScreen(nav: NavHostController, characterId: String) {
     var identityDraft by remember { mutableStateOf("") }
     var backgroundDraft by remember { mutableStateOf("") }
     var catchphraseDraft by remember { mutableStateOf("") }
+    var routineDraft by remember { mutableStateOf("") }
+    var fillingLife by remember { mutableStateOf(false) }
     var memeDraft by remember { mutableFloatStateOf(50f) }
     var intimacyDraft by remember { mutableFloatStateOf(0f) }
     var prefWarmth by remember { mutableFloatStateOf(50f) }
@@ -2130,6 +2267,7 @@ fun CharacterSettingsScreen(nav: NavHostController, characterId: String) {
             identityDraft = current.identity
             backgroundDraft = current.background
             catchphraseDraft = current.catchphrase
+            routineDraft = current.routine
             memeDraft = current.memeLevel.toFloat()
             baseUrl = current.apiBaseUrl
             model = current.apiModel
@@ -2296,7 +2434,48 @@ fun CharacterSettingsScreen(nav: NavHostController, characterId: String) {
                 Spacer(Modifier.height(12.dp))
                 GlassCard(Modifier.fillMaxWidth(), accent = accent) {
                     Text("她的基础设定", style = MaterialTheme.typography.titleSmall)
-                    Spacer(Modifier.height(8.dp))
+                    Spacer(Modifier.height(2.dp))
+                    TextButton(
+                        enabled = !fillingLife && character != null,
+                        onClick = {
+                            val current = character ?: return@TextButton
+                            fillingLife = true
+                            scope.launch {
+                                try {
+                                    val raw = withContext(Dispatchers.IO) {
+                                        Llm.complete(
+                                            current,
+                                            PromptBuilder.fillLife(current),
+                                            emptyList()
+                                        )
+                                    }
+                                    val start = raw.indexOf('{')
+                                    val end = raw.lastIndexOf('}')
+                                    if (start < 0 || end <= start) {
+                                        throw IllegalStateException("返回格式不对")
+                                    }
+                                    val json = JSONObject(raw.substring(start, end + 1))
+                                    json.optString("identity").takeIf { it.isNotBlank() }
+                                        ?.let { identityDraft = it.take(60) }
+                                    json.optString("background").takeIf { it.isNotBlank() }
+                                        ?.let { backgroundDraft = it.take(120) }
+                                    val r = json.optString("routine")
+                                    if (Routine.templates.any { it.first == r }) routineDraft = r
+                                    Toast.makeText(context, "补好了，看看再保存", Toast.LENGTH_SHORT)
+                                        .show()
+                                } catch (e: Exception) {
+                                    Toast.makeText(
+                                        context, e.message ?: "补全失败", Toast.LENGTH_SHORT
+                                    ).show()
+                                } finally {
+                                    fillingLife = false
+                                }
+                            }
+                        }
+                    ) {
+                        Text(if (fillingLife) "正在补全…" else "帮她补全生活")
+                    }
+                    Spacer(Modifier.height(2.dp))
                     OutlinedTextField(
                         value = identityDraft,
                         onValueChange = { identityDraft = it.take(60) },
@@ -2319,6 +2498,30 @@ fun CharacterSettingsScreen(nav: NavHostController, characterId: String) {
                         modifier = Modifier.fillMaxWidth(),
                         label = { Text("说话习惯 / 口头禅") },
                         placeholder = { Text("比如：爱说「行吧」；生气时不叫人全名") }
+                    )
+                    Spacer(Modifier.height(10.dp))
+                    Text("生活作息", style = MaterialTheme.typography.titleSmall)
+                    Spacer(Modifier.height(6.dp))
+                    Row(
+                        Modifier.horizontalScroll(rememberScrollState()),
+                        horizontalArrangement = Arrangement.spacedBy(6.dp)
+                    ) {
+                        Routine.templates.forEach { (id, label) ->
+                            FilterChip(
+                                selected = routineDraft == id,
+                                onClick = {
+                                    routineDraft = if (routineDraft == id) "" else id
+                                },
+                                label = { Text(label, fontSize = 12.sp) }
+                            )
+                        }
+                    }
+                    Spacer(Modifier.height(4.dp))
+                    Text(
+                        "作息会真的影响她：上班、上课、午休、睡觉，回得快慢和句子长短都不一样；" +
+                            "熬夜后的第二天会困。",
+                        fontSize = 11.sp,
+                        color = c.muted
                     )
                     Spacer(Modifier.height(6.dp))
                     Row(verticalAlignment = Alignment.CenterVertically) {
@@ -2368,7 +2571,8 @@ fun CharacterSettingsScreen(nav: NavHostController, characterId: String) {
                                                     identity = identityDraft.trim(),
                                                     background = backgroundDraft.trim(),
                                                     catchphrase = catchphraseDraft.trim(),
-                                                    memeLevel = memeDraft.roundToInt()
+                                                    memeLevel = memeDraft.roundToInt(),
+                                                    routine = routineDraft
                                                 )
                                             )
                                         }
@@ -3003,7 +3207,7 @@ fun MeScreen(nav: NavHostController) {
                             steps = 17
                         )
                         Text(
-                            "每天最多 ${BehaviorSettings.proactiveDailyCap} 条（22:00-08:00 静默，求助类每天最多 1 次）",
+                            "每天最多 ${BehaviorSettings.proactiveDailyCap} 条（按她的作息，睡着时不发，求助类每天最多 1 次）",
                             style = MaterialTheme.typography.bodySmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant
                         )

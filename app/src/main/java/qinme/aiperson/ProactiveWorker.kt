@@ -11,7 +11,7 @@ import kotlin.random.Random
 
 /**
  * 主动消息：她可以想念、分享、也可以突然找你求助。
- * 只在开关打开后运行；22:00-08:00 静默；每天有上限。
+ * 只在开关打开后运行；按各自的作息，睡着时不发；每天有上限。
  * 发不发、隔多久发，按她的底色和关系算，不设每日保底。
  */
 class ProactiveWorker(
@@ -32,7 +32,6 @@ class ProactiveWorker(
         AppGraph.init(applicationContext)
         BehaviorSettings.init(applicationContext)
         if (!BehaviorSettings.proactiveEnabled) return Result.success()
-        if (Timing.inQuietHours(System.currentTimeMillis())) return Result.success()
 
         val manager = androidx.core.app.NotificationManagerCompat.from(applicationContext)
         if (!manager.areNotificationsEnabled()) return Result.success()
@@ -53,6 +52,9 @@ class ProactiveWorker(
             val personality = db.personalityDao().get(character.id)
                 ?: PersonalityEntity(characterId = character.id)
             val shown = effectivePersonality(personality, relationship.intimacy)
+            // 睡着的角色不主动发；正忙的时候也没空找你
+            if (Timing.isAsleep(now, character.id, shown, character.routine)) return@mapNotNull null
+            if (Routine.busy(now, character.routine) == 2) return@mapNotNull null
 
             // 越主动、越粘、关系越近，间隔越短；清冷的人可能几天才想找他一次
             val intervalHours = (30f -
@@ -85,7 +87,11 @@ class ProactiveWorker(
             db.memoryDao().touchRecalled(memories.map { it.id }, now)
         }
 
-        val kind = pickKind(target.shown, character.id)
+        val kind = pickKind(
+            target.shown,
+            character.id,
+            memories.any { now - it.createdAt > TimeUnit.DAYS.toMillis(1) }
+        )
         val knownDays = ((now - character.createdAt) / TimeUnit.DAYS.toMillis(1)).toInt() + 1
         val totalMessages = db.messageDao().countDialogue(character.id)
         val system = PromptBuilder.proactive(
@@ -139,8 +145,8 @@ class ProactiveWorker(
         return Result.success()
     }
 
-    /** 想念/分享按她的性格加权，求助只在今天还没用过时出现；不连续重复上一轮的意图。 */
-    private fun pickKind(personality: PersonalityEntity, characterId: String): String {
+    /** 想念/分享按她的性格加权，求助只在今天还没用过时出现；有旧事时偶尔接着上次说。 */
+    private fun pickKind(personality: PersonalityEntity, characterId: String, hasOldMemory: Boolean): String {
         val last = BehaviorSettings.lastKind(characterId)
         val pool = buildList {
             repeat((10 + personality.clinginess).coerceIn(5, 40)) { add(KIND_MISS) }
@@ -148,6 +154,8 @@ class ProactiveWorker(
             if (BehaviorSettings.canSendHelpToday()) {
                 repeat((5 + personality.initiative / 2).coerceIn(2, 30)) { add(KIND_HELP) }
             }
+            // 真人不只问候，也会接着上次没说完的事问一句
+            if (hasOldMemory) repeat(18) { add(KIND_FOLLOWUP) }
         }.filter { it != last }
         return pool.randomOrNull() ?: KIND_SHARE
     }
@@ -156,6 +164,7 @@ class ProactiveWorker(
         const val KIND_MISS = "想念"
         const val KIND_SHARE = "分享日常"
         const val KIND_HELP = "求助"
+        const val KIND_FOLLOWUP = "想起以前的事"
     }
 }
 

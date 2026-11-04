@@ -324,6 +324,9 @@ object Backup {
         .put("background", background)
         .put("catchphrase", catchphrase)
         .put("memeLevel", memeLevel)
+        .put("innerState", innerState)
+        .put("innerAt", innerAt)
+        .put("routine", routine)
 
     private fun JSONObject.toCharacter() = CharacterEntity(
         id = getString("id"),
@@ -344,7 +347,10 @@ object Backup {
         identity = optString("identity", ""),
         background = optString("background", ""),
         catchphrase = optString("catchphrase", ""),
-        memeLevel = optInt("memeLevel", 50)
+        memeLevel = optInt("memeLevel", 50),
+        innerState = optString("innerState", ""),
+        innerAt = optLong("innerAt", 0),
+        routine = optString("routine", "")
     )
 
     private fun MessageEntity.toJson() = JSONObject()
@@ -357,6 +363,8 @@ object Backup {
         .put("imagePath", imagePath)
         .put("imageCaption", imageCaption)
         .put("visibleAt", visibleAt)
+        .put("quoteFrom", quoteFrom)
+        .put("quoteText", quoteText)
 
     private fun JSONObject.toMessage() = MessageEntity(
         id = optLong("id", 0),
@@ -367,7 +375,9 @@ object Backup {
         proactive = optBoolean("proactive", false),
         imagePath = optString("imagePath", ""),
         imageCaption = optString("imageCaption", ""),
-        visibleAt = optLong("visibleAt", 0)
+        visibleAt = optLong("visibleAt", 0),
+        quoteFrom = optString("quoteFrom", ""),
+        quoteText = optString("quoteText", "")
     )
 
     private fun MemoryEntity.toJson() = JSONObject()
@@ -381,6 +391,9 @@ object Backup {
         .put("pinned", pinned)
         .put("createdAt", createdAt)
         .put("lastRecalledAt", lastRecalledAt)
+        .put("kind", kind)
+        .put("mentions", mentions)
+        .put("resolved", resolved)
 
     private fun JSONObject.toMemory() = MemoryEntity(
         id = optLong("id", 0),
@@ -392,6 +405,9 @@ object Backup {
         tier = optString("tier", "ACTIVE"),
         pinned = optBoolean("pinned", false),
         createdAt = optLong("createdAt", 0),
-        lastRecalledAt = optLong("lastRecalledAt", 0)
+        lastRecalledAt = optLong("lastRecalledAt", 0),
+        kind = optString("kind", ""),
+        mentions = optInt("mentions", 0),
+        resolved = optBoolean("resolved", false)
     )
 }
