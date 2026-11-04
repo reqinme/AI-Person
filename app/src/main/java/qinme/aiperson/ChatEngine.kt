@@ -10,10 +10,14 @@ import androidx.work.WorkerParameters
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import org.json.JSONObject
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicLong
 import kotlin.random.Random
 
 /**
@@ -41,17 +45,9 @@ object ChatEngine {
     suspend fun send(characterId: String, text: String, imageName: String = ""): Result =
         withContext(Dispatchers.IO) {
             val db = AppGraph.db
-            val character = db.characterDao().get(characterId)
-                ?: return@withContext Result(false, "角色不存在")
-
+            val now = System.currentTimeMillis()
             val relationship = db.relationshipDao().get(characterId)
                 ?: RelationshipEntity(characterId = characterId).also { db.relationshipDao().upsert(it) }
-            val personality = db.personalityDao().get(characterId)
-                ?: PersonalityEntity(characterId = characterId).also { db.personalityDao().upsert(it) }
-            val mood = db.moodDao().get(characterId)
-                ?: MoodEntity(characterId = characterId).also { db.moodDao().upsert(it) }
-
-            val now = System.currentTimeMillis()
             val messageId = db.messageDao().insert(
                 MessageEntity(
                     characterId = characterId,
@@ -63,10 +59,44 @@ object ChatEngine {
             )
             db.relationshipDao().upsert(relationship.copy(lastChatAt = now))
 
-            val history = db.messageDao().recent(characterId, 24)
+            // 连发合并：人不会每收到一条就回一次。等一小会儿，只让最后一条触发回复。
+            val ticket = tickets.getOrPut(characterId) { AtomicLong(0) }.incrementAndGet()
+            delay(BURST_WINDOW_MS)
+            if (tickets[characterId]?.get() != ticket) return@withContext Result(true)
+
+            // 同一角色同时只允许一轮回复，避免两轮各自读到旧上下文、说出重复的话
+            locks.getOrPut(characterId) { Mutex() }.withLock {
+                if (tickets[characterId]?.get() != ticket) return@withLock Result(true)
+                // 她还没发出去的延迟回复作废，新的一轮统一重答
+                db.messageDao().dropPendingReplies(characterId, System.currentTimeMillis())
+                generateTurn(characterId, messageId, text, imageName)
+            }
+        }
+
+    private suspend fun generateTurn(
+        characterId: String,
+        messageId: Long,
+        text: String,
+        imageName: String
+    ): Result {
+            val db = AppGraph.db
+            val character = db.characterDao().get(characterId)
+                ?: return Result(false, "角色不存在")
+
+            val relationship = db.relationshipDao().get(characterId)
+                ?: RelationshipEntity(characterId = characterId).also { db.relationshipDao().upsert(it) }
+            val personality = db.personalityDao().get(characterId)
+                ?: PersonalityEntity(characterId = characterId).also { db.personalityDao().upsert(it) }
+            val mood = db.moodDao().get(characterId)
+                ?: MoodEntity(characterId = characterId).also { db.moodDao().upsert(it) }
+
+            val now = System.currentTimeMillis()
+
+            // 连发时几条消息都在这里；她自己刚说的回复也要算进上下文，否则会重复
+            val history = db.messageDao().recent(characterId, 40)
                 .filter {
                     (it.role == "user" || it.role == "assistant") &&
-                        (it.visibleAt == 0L || it.visibleAt <= now)
+                        (it.visibleAt == 0L || it.visibleAt <= now + 60_000L)
                 }
                 .reversed()
             val memories = db.memoryDao().recall(characterId, BehaviorSettings.RECALL_LIMIT)
@@ -98,7 +128,7 @@ object ChatEngine {
                         createdAt = System.currentTimeMillis()
                     )
                 )
-                return@withContext Result(false, e.message ?: "连接失败")
+                return Result(false, e.message ?: "连接失败")
             }
 
             val decision = parse(raw).let { first ->
@@ -207,10 +237,16 @@ object ChatEngine {
 
             // 记忆压缩会再调一次模型，不能阻塞本轮发送；后台跑，失败下次再补
             growthScope.launch { runCatching { GrowthEngine.maybeGrow(characterId) } }
-            Result(true)
-        }
+            return Result(true)
+    }
 
     private val growthScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+
+    /** 同一角色的回复串行执行，避免两轮同时跑。 */
+    private val locks = java.util.concurrent.ConcurrentHashMap<String, Mutex>()
+    /** 连发计数：最后一条消息才负责触发回复。 */
+    private val tickets = java.util.concurrent.ConcurrentHashMap<String, AtomicLong>()
+    private const val BURST_WINDOW_MS = 2_500L
 
     /**
      * 回复拆成一到三条气泡，第二条起错开一两秒，
@@ -251,7 +287,7 @@ object ChatEngine {
         if (trimmed.isEmpty()) return listOf("……")
         if (trimmed.length <= 20) return listOf(trimmed)
 
-        val pieces = trimmed.split(Regex("(?<=[。！？…!?~])|\\n"))
+        val pieces = trimmed.split(Regex("(?<=[。！？!?~])|\\n"))
             .map { it.trim() }
             .filter { it.isNotEmpty() }
         val segments = if (pieces.size <= 1) listOf(trimmed) else pieces
@@ -261,6 +297,9 @@ object ChatEngine {
         segments.forEach { piece ->
             if (buffer.isEmpty()) {
                 buffer = piece
+            } else if (buffer.endsWith("……") || buffer.endsWith("...")) {
+                // 上一段是没说完的半句，不能在这里断开
+                buffer += piece
             } else if ((buffer + piece).length <= 26 && bubbles.size < 2) {
                 buffer += piece
             } else {

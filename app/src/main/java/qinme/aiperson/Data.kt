@@ -269,6 +269,9 @@ interface MessageDao {
     )
     suspend fun searchAll(q: String): List<MessageHit>
 
+    @Query("DELETE FROM messages WHERE characterId = :characterId AND role = 'assistant' AND visibleAt > :now")
+    suspend fun dropPendingReplies(characterId: String, now: Long)
+
     @Query("DELETE FROM messages WHERE characterId = :characterId")
     suspend fun deleteAll(characterId: String)
 
