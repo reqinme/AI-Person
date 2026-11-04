@@ -2,10 +2,12 @@ package qinme.aiperson
 
 import android.content.Context
 import android.net.Uri
+import androidx.room.withTransaction
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import org.json.JSONArray
 import org.json.JSONObject
+import java.io.File
 import java.io.OutputStream
 import java.util.zip.ZipEntry
 import java.util.zip.ZipInputStream
@@ -17,6 +19,10 @@ import java.util.zip.ZipOutputStream
  */
 object Backup {
 
+    // 备份图片的大小上限，防止恶意/损坏的 zip 把手机存储写满
+    private const val MAX_MEDIA_FILE = 20L * 1024 * 1024
+    private const val MAX_MEDIA_TOTAL = 300L * 1024 * 1024
+
     suspend fun export(context: Context, uri: Uri): Result<Unit> = withContext(Dispatchers.IO) {
         runCatching {
             val db = AppGraph.db
@@ -25,10 +31,11 @@ object Backup {
             val memories = db.memoryDao().all()
             val relationships = db.relationshipDao().all()
             val personalities = db.personalityDao().all()
+            val personaHistory = db.personaHistoryDao().all()
             val moods = characters.mapNotNull { db.moodDao().get(it.id) }
 
             val root = JSONObject()
-                .put("version", 2)
+                .put("version", 3)
                 .put("exportedAt", System.currentTimeMillis())
                 .put("note", "API Key 不包含在备份中，导入后需要为每个角色重新填写。")
                 .put("characters", JSONArray().apply { characters.forEach { put(it.toJson()) } })
@@ -59,6 +66,25 @@ object Backup {
                                 .put("prefInitiative", item.prefInitiative)
                                 .put("prefIndependence", item.prefIndependence)
                                 .put("prefClinginess", item.prefClinginess)
+                                .put("temperament", item.temperament)
+                                .put("baseWarmth", item.baseWarmth)
+                                .put("baseLiveliness", item.baseLiveliness)
+                                .put("baseInitiative", item.baseInitiative)
+                                .put("baseIndependence", item.baseIndependence)
+                                .put("baseClinginess", item.baseClinginess)
+                                .put("personaChanges", item.personaChanges)
+                                .put("lastPersonaChangeAt", item.lastPersonaChangeAt)
+                        )
+                    }
+                })
+                .put("personaHistory", JSONArray().apply {
+                    personaHistory.forEach { item ->
+                        put(
+                            JSONObject()
+                                .put("characterId", item.characterId)
+                                .put("change", item.change)
+                                .put("reason", item.reason)
+                                .put("createdAt", item.createdAt)
                         )
                     }
                 })
@@ -94,9 +120,10 @@ object Backup {
             zout.write(json.toByteArray())
             zout.closeEntry()
             media.forEach { name ->
-                val file = ImageStore.file(context, name)
+                val safe = safeName(name) ?: return@forEach
+                val file = ImageStore.file(context, safe)
                 if (!file.exists()) return@forEach
-                zout.putNextEntry(ZipEntry("media/$name"))
+                zout.putNextEntry(ZipEntry("media/$safe"))
                 file.inputStream().use { it.copyTo(zout) }
                 zout.closeEntry()
             }
@@ -135,18 +162,39 @@ object Backup {
                 )
             }
             val personalities = root.array("personalities").map {
+                val warmth = it.optInt("warmth", 50)
+                val liveliness = it.optInt("liveliness", 50)
+                val initiative = it.optInt("initiative", 40)
+                val independence = it.optInt("independence", 50)
+                val clinginess = it.optInt("clinginess", 30)
                 PersonalityEntity(
                     characterId = it.getString("characterId"),
-                    warmth = it.optInt("warmth", 50),
-                    liveliness = it.optInt("liveliness", 50),
-                    initiative = it.optInt("initiative", 40),
-                    independence = it.optInt("independence", 50),
-                    clinginess = it.optInt("clinginess", 30),
-                    prefWarmth = it.optInt("prefWarmth", 50),
-                    prefLiveliness = it.optInt("prefLiveliness", 50),
-                    prefInitiative = it.optInt("prefInitiative", 40),
-                    prefIndependence = it.optInt("prefIndependence", 50),
-                    prefClinginess = it.optInt("prefClinginess", 30)
+                    warmth = warmth,
+                    liveliness = liveliness,
+                    initiative = initiative,
+                    independence = independence,
+                    clinginess = clinginess,
+                    prefWarmth = it.optInt("prefWarmth", warmth),
+                    prefLiveliness = it.optInt("prefLiveliness", liveliness),
+                    prefInitiative = it.optInt("prefInitiative", initiative),
+                    prefIndependence = it.optInt("prefIndependence", independence),
+                    prefClinginess = it.optInt("prefClinginess", clinginess),
+                    temperament = it.optString("temperament", "自定义"),
+                    baseWarmth = it.optInt("baseWarmth", warmth),
+                    baseLiveliness = it.optInt("baseLiveliness", liveliness),
+                    baseInitiative = it.optInt("baseInitiative", initiative),
+                    baseIndependence = it.optInt("baseIndependence", independence),
+                    baseClinginess = it.optInt("baseClinginess", clinginess),
+                    personaChanges = it.optString("personaChanges", ""),
+                    lastPersonaChangeAt = it.optLong("lastPersonaChangeAt", 0)
+                )
+            }
+            val personaHistory = root.array("personaHistory").map {
+                PersonaChangeEntity(
+                    characterId = it.getString("characterId"),
+                    change = it.optString("change", ""),
+                    reason = it.optString("reason", ""),
+                    createdAt = it.optLong("createdAt", 0)
                 )
             }
             val moods = root.array("moods").map {
@@ -159,19 +207,31 @@ object Backup {
             }
 
             val db = AppGraph.db
-            db.messageDao().clear()
-            db.memoryDao().clear()
-            db.relationshipDao().clear()
-            db.personalityDao().clear()
-            db.moodDao().clear()
-            db.characterDao().clear()
+            // 整体事务：中途失败不会留下半套数据
+            db.withTransaction {
+                db.messageDao().clear()
+                db.memoryDao().clear()
+                db.relationshipDao().clear()
+                db.personalityDao().clear()
+                db.personaHistoryDao().clear()
+                db.moodDao().clear()
+                db.characterDao().clear()
 
-            characters.forEach { db.characterDao().upsert(it) }
-            messages.forEach { db.messageDao().insert(it) }
-            memories.forEach { db.memoryDao().insert(it) }
-            relationships.forEach { db.relationshipDao().upsert(it) }
-            personalities.forEach { db.personalityDao().upsert(it) }
-            moods.forEach { db.moodDao().upsert(it) }
+                characters.forEach { db.characterDao().upsert(it) }
+                messages.forEach { db.messageDao().insert(it) }
+                memories.forEach { db.memoryDao().insert(it) }
+                relationships.forEach { db.relationshipDao().upsert(it) }
+                personalities.forEach { db.personalityDao().upsert(it) }
+                personaHistory.forEach { db.personaHistoryDao().insert(it) }
+                moods.forEach { db.moodDao().upsert(it) }
+            }
+
+            // 覆盖导入时，旧的亲密度内部累计/压缩进度可能和新数据不一致，重置成导入值
+            relationships.forEach {
+                BehaviorSettings.setIntimacyRaw(it.characterId, it.intimacy)
+                BehaviorSettings.resetIdlePenalty(it.characterId)
+                BehaviorSettings.setLastEvalId(it.characterId, 0L)
+            }
 
             // 数据落库后再解压图片；缺失的图片不影响文字内容。
             extractMedia(context, uri)
@@ -181,22 +241,60 @@ object Backup {
     }
 
     private fun extractMedia(context: Context, uri: Uri) {
+        val writtenFiles = mutableListOf<File>()
         runCatching {
+            var total = 0L
             context.contentResolver.openInputStream(uri)?.use { raw ->
                 ZipInputStream(raw.buffered()).use { zin ->
                     var entry = zin.nextEntry
                     while (entry != null) {
-                        if (entry.name.startsWith("media/") && !entry.isDirectory) {
-                            val name = entry.name.removePrefix("media/")
-                            ImageStore.file(context, name).outputStream()
-                                .use { out -> zin.copyTo(out) }
+                        val name = entry.name
+                        if (!entry.isDirectory && name.startsWith("media/")) {
+                            // 只接受 media/ 下的单层文件名，挡住 ../ 和绝对路径
+                            val safe = safeName(name.removePrefix("media/"))
+                            if (safe != null) {
+                                val target = ImageStore.file(context, safe)
+                                val written = runCatching {
+                                    var size = 0L
+                                    target.outputStream().use { out ->
+                                        val buffer = ByteArray(8192)
+                                        while (true) {
+                                            val read = zin.read(buffer)
+                                            if (read < 0) break
+                                            if (read == 0) continue
+                                            size += read
+                                            if (size > MAX_MEDIA_FILE) error("单张图片超过上限")
+                                            out.write(buffer, 0, read)
+                                        }
+                                    }
+                                    size
+                                }.getOrNull()
+                                if (written == null) {
+                                    target.delete()
+                                } else {
+                                    writtenFiles.add(target)
+                                    total += written
+                                    if (total > MAX_MEDIA_TOTAL) error("备份图片总量超过上限")
+                                }
+                            }
                         }
                         zin.closeEntry()
                         entry = zin.nextEntry
                     }
                 }
             }
+        }.onFailure {
+            // 超限或损坏时，把已经写出来的半成品清掉
+            writtenFiles.forEach { it.delete() }
         }
+    }
+
+    private fun safeName(raw: String): String? {
+        val name = raw.trim()
+        if (name.isEmpty() || name.length > 128) return null
+        if (name == "." || name == "..") return null
+        if (name.contains('/') || name.contains('\\') || name.contains(':')) return null
+        return name
     }
 
     private fun JSONObject.array(key: String): List<JSONObject> {
@@ -220,6 +318,8 @@ object Backup {
         .put("strongAlertAt", strongAlertAt)
         .put("apiBaseUrl", apiBaseUrl)
         .put("apiModel", apiModel)
+        .put("vision", vision)
+        .put("nickname", nickname)
 
     private fun JSONObject.toCharacter() = CharacterEntity(
         id = getString("id"),
@@ -234,7 +334,9 @@ object Backup {
         pinned = optBoolean("pinned", false),
         strongAlertAt = optLong("strongAlertAt", 0),
         apiBaseUrl = optString("apiBaseUrl", ""),
-        apiModel = optString("apiModel", "")
+        apiModel = optString("apiModel", ""),
+        vision = optBoolean("vision", true),
+        nickname = optString("nickname", "")
     )
 
     private fun MessageEntity.toJson() = JSONObject()

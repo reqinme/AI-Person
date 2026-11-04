@@ -92,4 +92,11 @@ object Notifier {
             RingtoneManager.getRingtone(context.applicationContext, uri)?.play()
         }
     }
+
+    /** 清空聊天时顺手撤掉她还没被点掉的通知。 */
+    fun cancel(context: Context, characterId: String) {
+        runCatching {
+            NotificationManagerCompat.from(context).cancel(2000 + characterId.hashCode())
+        }
+    }
 }

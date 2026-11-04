@@ -14,6 +14,7 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.detectTapGestures
+import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
@@ -48,6 +49,7 @@ import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalLifecycleOwner
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.PasswordVisualTransformation
@@ -55,12 +57,16 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.core.app.NotificationManagerCompat
 import androidx.core.content.ContextCompat
 import androidx.core.content.FileProvider
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
 import androidx.navigation.NavHostController
 import androidx.navigation.compose.NavHost
 import androidx.navigation.compose.composable
 import androidx.navigation.compose.rememberNavController
+import androidx.work.WorkManager
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
@@ -74,6 +80,23 @@ import java.util.UUID
 import kotlin.math.roundToInt
 
 // ---------------------------------------------------------------- 主题
+
+private fun notificationsEnabled(context: Context): Boolean =
+    NotificationManagerCompat.from(context).areNotificationsEnabled()
+
+/** 每次回到前台执行一次，用来复查通知权限是否被系统关掉。 */
+@Composable
+private fun OnResume(block: () -> Unit) {
+    val owner = LocalLifecycleOwner.current
+    val current by rememberUpdatedState(block)
+    DisposableEffect(owner) {
+        val observer = LifecycleEventObserver { _, event ->
+            if (event == Lifecycle.Event.ON_RESUME) current()
+        }
+        owner.lifecycle.addObserver(observer)
+        onDispose { owner.lifecycle.removeObserver(observer) }
+    }
+}
 
 private val LightColors = lightColorScheme(
     primary = Color(0xFF07C160),
@@ -565,7 +588,8 @@ private suspend fun createCharacter(
     persona: String,
     dislikes: String,
     accent: Int,
-    avatarPath: String
+    avatarPath: String,
+    temperament: Temperament
 ) {
     val id = UUID.randomUUID().toString()
     AppGraph.db.characterDao().upsert(
@@ -581,7 +605,29 @@ private suspend fun createCharacter(
         )
     )
     AppGraph.db.relationshipDao().upsert(RelationshipEntity(characterId = id))
-    AppGraph.db.personalityDao().upsert(PersonalityEntity(characterId = id))
+    // 当前值从底色附近起步，底色本身是之后所有变化的锚点
+    fun around(value: Int) = (value + kotlin.random.Random.nextInt(-3, 4)).coerceIn(0, 100)
+    AppGraph.db.personalityDao().upsert(
+        PersonalityEntity(
+            characterId = id,
+            warmth = around(temperament.warmth),
+            liveliness = around(temperament.liveliness),
+            initiative = around(temperament.initiative),
+            independence = around(temperament.independence),
+            clinginess = around(temperament.clinginess),
+            prefWarmth = temperament.warmth,
+            prefLiveliness = temperament.liveliness,
+            prefInitiative = temperament.initiative,
+            prefIndependence = temperament.independence,
+            prefClinginess = temperament.clinginess,
+            temperament = temperament.name,
+            baseWarmth = temperament.warmth,
+            baseLiveliness = temperament.liveliness,
+            baseInitiative = temperament.initiative,
+            baseIndependence = temperament.independence,
+            baseClinginess = temperament.clinginess
+        )
+    )
     AppGraph.db.moodDao().upsert(MoodEntity(characterId = id))
     BehaviorSettings.setIntimacyRaw(id, 0)
 }
@@ -595,6 +641,15 @@ fun CharacterListScreen(nav: NavHostController) {
     var showCreate by remember { mutableStateOf(false) }
     val scope = rememberCoroutineScope()
     val c = weChatColors()
+
+    // 延迟消息到点后，列表预览需要自己刷新，不能只依赖数据库变更
+    var nowTick by remember { mutableStateOf(System.currentTimeMillis()) }
+    LaunchedEffect(Unit) {
+        while (true) {
+            delay(30_000)
+            nowTick = System.currentTimeMillis()
+        }
+    }
 
     WeChatScreenBackground(accent = c.accent) {
         Column(Modifier.fillMaxSize()) {
@@ -630,7 +685,7 @@ fun CharacterListScreen(nav: NavHostController) {
                         verticalArrangement = Arrangement.spacedBy(8.dp)
                     ) {
                         items(characters, key = { it.id }) { character ->
-                            ConversationRow(character, nav)
+                            ConversationRow(character, nav, nowTick)
                         }
                         item {
                             Box(
@@ -654,32 +709,35 @@ fun CharacterListScreen(nav: NavHostController) {
     if (showCreate) {
         CreateCharacterDialog(
             onDismiss = { showCreate = false },
-            onCreate = { name, gender, persona, dislikes, accent, avatar ->
+            onCreate = { name, gender, persona, dislikes, accent, avatar, temperament ->
                 showCreate = false
-                scope.launch { createCharacter(name, gender, persona, dislikes, accent, avatar) }
+                scope.launch {
+                    createCharacter(name, gender, persona, dislikes, accent, avatar, temperament)
+                }
             }
         )
     }
 }
 
 @Composable
-private fun ConversationRow(character: CharacterEntity, nav: NavHostController) {
+private fun ConversationRow(character: CharacterEntity, nav: NavHostController, now: Long) {
     val c = weChatColors()
     val relationship by AppGraph.db.relationshipDao()
         .observe(character.id)
         .collectAsState(initial = null)
-    val last by AppGraph.db.messageDao()
-        .observeLast(character.id)
-        .collectAsState(initial = null)
-    val shownLast = last?.takeIf {
-        it.visibleAt == 0L || it.visibleAt <= System.currentTimeMillis()
+    val recent by remember(character.id) {
+        AppGraph.db.messageDao().observeRecent(character.id, 20)
+    }.collectAsState(initial = emptyList())
+    val last = remember(recent, now) {
+        recent.firstOrNull {
+            (it.visibleAt == 0L || it.visibleAt <= now) &&
+                !(it.role == "note" && it.content.isBlank())
+        }
     }
     val shape = RoundedCornerShape(18.dp)
-    val preview = when {
-        shownLast == null -> "还没开始聊天"
-        shownLast.imagePath.isNotBlank() -> "[图片]"
-        else -> shownLast.content.ifBlank { "…" }
-    }
+    val preview = last?.let { msg ->
+        if (msg.imagePath.isNotBlank()) "[图片]" else msg.content.ifBlank { "…" }
+    } ?: "还没开始聊天"
 
     Row(
         Modifier
@@ -728,7 +786,7 @@ private fun ConversationRow(character: CharacterEntity, nav: NavHostController) 
         Spacer(Modifier.width(8.dp))
         Column(horizontalAlignment = Alignment.End) {
             Text(
-                shownLast?.let { listTime(it.visibleAt.takeIf { v -> v > 0 } ?: it.createdAt) } ?: "",
+                last?.let { listTime(it.visibleAt.takeIf { v -> v > 0 } ?: it.createdAt) } ?: "",
                 fontSize = 11.sp,
                 color = c.muted
             )
@@ -747,12 +805,15 @@ private fun ConversationRow(character: CharacterEntity, nav: NavHostController) 
 @Composable
 private fun CreateCharacterDialog(
     onDismiss: () -> Unit,
-    onCreate: (String, String, String, String, Int, String) -> Unit
+    onCreate: (String, String, String, String, Int, String, Temperament) -> Unit
 ) {
     var name by remember { mutableStateOf("") }
     var gender by remember { mutableStateOf("女") }
-    var persona by remember { mutableStateOf("温柔，安静，偶尔有点小固执") }
-    var dislikes by remember { mutableStateOf("") }
+    var temperament by remember { mutableStateOf(Temperaments.ALL.first()) }
+    var persona by remember { mutableStateOf(Temperaments.ALL.first().hint) }
+    var dislikes by remember { mutableStateOf(Temperaments.ALL.first().dislikes) }
+    var personaEdited by remember { mutableStateOf(false) }
+    var dislikesEdited by remember { mutableStateOf(false) }
     var accent by remember { mutableStateOf(ACCENTS.first()) }
     var avatar by remember { mutableStateOf("") }
     val pickAvatar = rememberMediaPicker(ImageStore.Kind.AVATAR) { avatar = it }
@@ -795,16 +856,66 @@ private fun CreateCharacterDialog(
                         ) { Text(option) }
                     }
                 }
+                Spacer(Modifier.height(6.dp))
+                Text(
+                    "她的底色",
+                    fontSize = 12.sp,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+                Spacer(Modifier.height(4.dp))
+                Row(
+                    Modifier.horizontalScroll(rememberScrollState()),
+                    horizontalArrangement = Arrangement.spacedBy(6.dp)
+                ) {
+                    Temperaments.ALL.forEach { option ->
+                        val selected = temperament.name == option.name
+                        TextButton(
+                            onClick = {
+                                temperament = option
+                                if (!personaEdited) persona = option.hint
+                                if (!dislikesEdited) dislikes = option.dislikes
+                            },
+                            colors = ButtonDefaults.textButtonColors(
+                                contentColor = if (selected) {
+                                    MaterialTheme.colorScheme.primary
+                                } else {
+                                    MaterialTheme.colorScheme.onSurfaceVariant
+                                }
+                            ),
+                            modifier = Modifier
+                                .clip(RoundedCornerShape(12.dp))
+                                .background(
+                                    if (selected) {
+                                        MaterialTheme.colorScheme.primary.copy(alpha = 0.12f)
+                                    } else {
+                                        Color.Transparent
+                                    }
+                                )
+                        ) { Text(option.name) }
+                    }
+                }
+                Text(
+                    temperament.style,
+                    fontSize = 11.sp,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+                Spacer(Modifier.height(10.dp))
                 OutlinedTextField(
                     value = persona,
-                    onValueChange = { persona = it.take(80) },
+                    onValueChange = {
+                        persona = it.take(80)
+                        personaEdited = true
+                    },
                     label = { Text("性格") },
                     modifier = Modifier.fillMaxWidth()
                 )
                 Spacer(Modifier.height(12.dp))
                 OutlinedTextField(
                     value = dislikes,
-                    onValueChange = { dislikes = it.take(120) },
+                    onValueChange = {
+                        dislikes = it.take(120)
+                        dislikesEdited = true
+                    },
                     label = { Text("底线（可留空）") },
                     placeholder = { Text("留空默认：被欺骗、被敷衍 / 被当工具使唤 / 被无视") },
                     modifier = Modifier.fillMaxWidth()
@@ -831,7 +942,9 @@ private fun CreateCharacterDialog(
         confirmButton = {
             TextButton(
                 onClick = {
-                    onCreate(name.trim(), gender, persona.trim(), dislikes.trim(), accent, avatar)
+                    onCreate(
+                        name.trim(), gender, persona.trim(), dislikes.trim(), accent, avatar, temperament
+                    )
                 },
                 enabled = name.isNotBlank()
             ) { Text("创建") }
@@ -1027,23 +1140,25 @@ fun ChatScreen(nav: NavHostController, characterId: String) {
 
     LaunchedEffect(Unit) {
         while (true) {
-            delay(20_000)
+            delay(1_000)
             nowTick = System.currentTimeMillis()
         }
     }
 
-    val visible = remember(messages, nowTick) {
-        messages
-            .filter { it.visibleAt == 0L || it.visibleAt <= nowTick }
-            .filterNot { it.role == "note" && it.content.isBlank() }
+    // 到时间可见的消息。已读推断要用这一份，silent 的空 note 不能被过滤掉。
+    val onTimeMessages = remember(messages, nowTick) {
+        messages.filter { it.visibleAt == 0L || it.visibleAt <= nowTick }
+    }
+    val visible = remember(onTimeMessages) {
+        onTimeMessages.filterNot { it.role == "note" && it.content.isBlank() }
     }
 
     // 已读推断：这条用户消息之后出现了她的回复或隐藏占位，就算已读
-    val readIds = remember(visible) {
+    val readIds = remember(onTimeMessages) {
         val read = mutableSetOf<Long>()
-        visible.forEachIndexed { index, message ->
+        onTimeMessages.forEachIndexed { index, message ->
             if (message.role == "user") {
-                val later = visible.subList(index + 1, visible.size)
+                val later = onTimeMessages.subList(index + 1, onTimeMessages.size)
                 if (later.any { it.role == "assistant" || it.role == "note" }) read.add(message.id)
             }
         }
@@ -1645,9 +1760,32 @@ fun ChatMenuScreen(nav: NavHostController, characterId: String) {
     var dislikeCount by remember { mutableIntStateOf(0) }
     val scope = rememberCoroutineScope()
 
+    val setStrongAlert: (Boolean) -> Unit = { on ->
+        scope.launch {
+            AppGraph.db.characterDao().get(characterId)?.let {
+                val at = if (on) System.currentTimeMillis() + 24 * 3_600_000L else 0L
+                AppGraph.db.characterDao().upsert(it.copy(strongAlertAt = at))
+            }
+        }
+    }
     val notificationPermission = rememberLauncherForActivityResult(
         ActivityResultContracts.RequestPermission()
-    ) { }
+    ) { granted ->
+        if (granted && notificationsEnabled(context)) {
+            setStrongAlert(true)
+        } else {
+            setStrongAlert(false)
+            Toast.makeText(context, "通知权限未开启，强提醒保持关闭", Toast.LENGTH_SHORT).show()
+        }
+    }
+    // 在系统设置里关掉通知后，回到 App 时自动把强提醒关掉
+    OnResume {
+        if ((character?.strongAlertAt ?: 0L) > System.currentTimeMillis() &&
+            !notificationsEnabled(context)
+        ) {
+            setStrongAlert(false)
+        }
+    }
 
     val pickBackground = rememberMediaPicker(ImageStore.Kind.BACKGROUND) { name ->
         scope.launch {
@@ -1739,21 +1877,12 @@ fun ChatMenuScreen(nav: NavHostController, characterId: String) {
                         },
                         checked = (character?.strongAlertAt ?: 0L) > System.currentTimeMillis()
                     ) { on ->
-                        if (on) {
+                        if (!on) {
+                            setStrongAlert(false)
+                        } else if (notificationsEnabled(context)) {
+                            setStrongAlert(true)
+                        } else {
                             notificationPermission.launch(Manifest.permission.POST_NOTIFICATIONS)
-                        }
-                        scope.launch {
-                            AppGraph.db.characterDao().get(characterId)?.let {
-                                AppGraph.db.characterDao().upsert(
-                                    it.copy(
-                                        strongAlertAt = if (on) {
-                                            System.currentTimeMillis() + 24 * 3_600_000L
-                                        } else {
-                                            0L
-                                        }
-                                    )
-                                )
-                            }
                         }
                     }
                     MenuDivider()
@@ -1778,11 +1907,22 @@ fun ChatMenuScreen(nav: NavHostController, characterId: String) {
                     MenuRow(title = "清空聊天记录", danger = true) {
                         confirm = ConfirmRequest(
                             title = "清空聊天记录",
-                            body = "只删除你们之间的消息，不会删除她的记忆，也不会改变亲密度。",
-                            secondBody = "聊天记录无法恢复，确定清空吗？",
+                            body = "会删除这段聊天的全部消息、聊天图片，以及还没到达的延迟回复；记忆、亲密度和人格都会保留。",
+                            secondBody = "聊天记录和图片无法恢复，确定清空吗？",
                             onConfirm = {
                                 scope.launch {
+                                    val images = AppGraph.db.messageDao().all(characterId)
+                                        .map { it.imagePath }
+                                        .filter { it.isNotBlank() }
+                                        .distinct()
                                     AppGraph.db.messageDao().deleteAll(characterId)
+                                    withContext(Dispatchers.IO) {
+                                        images.forEach { ImageStore.delete(context, it) }
+                                    }
+                                    WorkManager.getInstance(context)
+                                        .cancelAllWorkByTag("deliver_$characterId")
+                                    Notifier.cancel(context, characterId)
+                                    BehaviorSettings.setLastEvalId(characterId, 0L)
                                     ChatNav.pendingJump = null
                                 }
                             }
@@ -1955,6 +2095,16 @@ fun CharacterSettingsScreen(nav: NavHostController, characterId: String) {
         intimacyDraft = (relationship?.intimacy ?: 0).toFloat()
     }
 
+    // 当前实际人格（会随成长变化），用来展示“底色 + 成长 + 关系”
+    val livePersonality by AppGraph.db.personalityDao()
+        .observe(characterId)
+        .collectAsState(initial = null)
+    val personaHistory by AppGraph.db.personaHistoryDao()
+        .observe(characterId)
+        .collectAsState(initial = emptyList<PersonaChangeEntity>())
+    var retemperOpen by remember { mutableStateOf(false) }
+    var retemperPick by remember { mutableStateOf(Temperaments.ALL.first()) }
+
     val accent = character?.accentColor?.let { Color(it) } ?: c.accent
     val pickAvatar = rememberMediaPicker(ImageStore.Kind.AVATAR) { name ->
         scope.launch {
@@ -1970,9 +2120,31 @@ fun CharacterSettingsScreen(nav: NavHostController, characterId: String) {
             }
         }
     }
+    val setStrongAlert: (Boolean) -> Unit = { on ->
+        scope.launch {
+            AppGraph.db.characterDao().get(characterId)?.let {
+                val at = if (on) System.currentTimeMillis() + 24 * 3_600_000L else 0L
+                AppGraph.db.characterDao().upsert(it.copy(strongAlertAt = at))
+            }
+        }
+    }
     val notificationPermission = rememberLauncherForActivityResult(
         ActivityResultContracts.RequestPermission()
-    ) { }
+    ) { granted ->
+        if (granted && notificationsEnabled(context)) {
+            setStrongAlert(true)
+        } else {
+            setStrongAlert(false)
+            Toast.makeText(context, "通知权限未开启，强提醒保持关闭", Toast.LENGTH_SHORT).show()
+        }
+    }
+    OnResume {
+        if ((character?.strongAlertAt ?: 0L) > System.currentTimeMillis() &&
+            !notificationsEnabled(context)
+        ) {
+            setStrongAlert(false)
+        }
+    }
 
     WeChatScreenBackground(accent = accent) {
         Column(Modifier.fillMaxSize()) {
@@ -2065,21 +2237,10 @@ fun CharacterSettingsScreen(nav: NavHostController, characterId: String) {
                         Switch(
                             checked = (character?.strongAlertAt ?: 0L) > System.currentTimeMillis(),
                             onCheckedChange = { on ->
-                                if (on) {
-                                    notificationPermission.launch(Manifest.permission.POST_NOTIFICATIONS)
-                                }
-                                scope.launch {
-                                    AppGraph.db.characterDao().get(characterId)?.let {
-                                        AppGraph.db.characterDao().upsert(
-                                            it.copy(
-                                                strongAlertAt = if (on) {
-                                                    System.currentTimeMillis() + 24 * 3_600_000L
-                                                } else {
-                                                    0L
-                                                }
-                                            )
-                                        )
-                                    }
+                                when {
+                                    !on -> setStrongAlert(false)
+                                    notificationsEnabled(context) -> setStrongAlert(true)
+                                    else -> notificationPermission.launch(Manifest.permission.POST_NOTIFICATIONS)
                                 }
                             }
                         )
@@ -2198,9 +2359,94 @@ fun CharacterSettingsScreen(nav: NavHostController, characterId: String) {
 
                 Spacer(Modifier.height(12.dp))
                 GlassCard(Modifier.fillMaxWidth(), accent = accent) {
-                    Text("她希望自己变成什么样（软引导）", style = MaterialTheme.typography.titleSmall)
+                    val live = livePersonality
+                    val intimacyNow = relationship?.intimacy ?: 0
+                    val gains = live?.let { relationGains(it, intimacyNow) }
                     Text(
-                        "只是方向偏好，她不一定完全照着走",
+                        "她的底色：${live?.temperament ?: "自定义"}",
+                        style = MaterialTheme.typography.titleSmall
+                    )
+                    Text(
+                        "底色是她最初的样子。之后的每一句话、每一次被认真回应，都会在这个底色上留一点痕迹。",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                    if (character?.nickname?.isNotBlank() == true) {
+                        Spacer(Modifier.height(6.dp))
+                        Text("她现在叫他「${character?.nickname}」", fontSize = 12.sp, color = c.text)
+                    }
+                    Spacer(Modifier.height(10.dp))
+                    Text("现在她实际的样子", fontSize = 12.sp, color = c.text)
+                    TraitEcho(
+                        "温柔",
+                        live?.baseWarmth ?: prefWarmth.roundToInt(),
+                        live?.warmth ?: prefWarmth.roundToInt(),
+                        gains?.warmth ?: 0
+                    )
+                    TraitEcho(
+                        "活泼",
+                        live?.baseLiveliness ?: prefLiveliness.roundToInt(),
+                        live?.liveliness ?: prefLiveliness.roundToInt(),
+                        gains = 0
+                    )
+                    TraitEcho(
+                        "主动",
+                        live?.baseInitiative ?: prefInitiative.roundToInt(),
+                        live?.initiative ?: prefInitiative.roundToInt(),
+                        gains?.initiative ?: 0
+                    )
+                    TraitEcho(
+                        "独立",
+                        live?.baseIndependence ?: prefIndependence.roundToInt(),
+                        live?.independence ?: prefIndependence.roundToInt(),
+                        gains = 0
+                    )
+                    TraitEcho(
+                        "粘人",
+                        live?.baseClinginess ?: prefClinginess.roundToInt(),
+                        live?.clinginess ?: prefClinginess.roundToInt(),
+                        gains?.clinginess ?: 0
+                    )
+
+                    Spacer(Modifier.height(12.dp))
+                    Text("这些年", style = MaterialTheme.typography.titleSmall)
+                    val narrative = (live?.personaChanges ?: "")
+                        .split('\n').map { it.trim() }.filter { it.isNotBlank() }
+                    if (narrative.isEmpty() && personaHistory.isEmpty()) {
+                        Text(
+                            "还没有明显的变化。变化很慢，通常要一起过一段时间才看得出来。",
+                            fontSize = 12.sp,
+                            color = c.muted
+                        )
+                    } else {
+                        narrative.forEach { line ->
+                            Text("· $line", fontSize = 12.sp, color = c.text)
+                        }
+                        personaHistory.take(6).forEach { item ->
+                            Text(
+                                "· ${dayLabel(item.createdAt)} ${item.change}" +
+                                    if (item.reason.isNotBlank()) "（${item.reason}）" else "",
+                                fontSize = 12.sp,
+                                color = c.muted
+                            )
+                        }
+                    }
+                    Spacer(Modifier.height(8.dp))
+                    TextButton(
+                        onClick = {
+                            retemperPick = live?.let { Temperaments.byName(it.temperament) }
+                                ?: Temperaments.ALL.first()
+                            retemperOpen = true
+                        },
+                        modifier = Modifier.align(Alignment.End)
+                    ) { Text("重新选择底色") }
+                }
+
+                Spacer(Modifier.height(12.dp))
+                GlassCard(Modifier.fillMaxWidth(), accent = accent) {
+                    Text("你希望她往哪边变（软引导）", style = MaterialTheme.typography.titleSmall)
+                    Text(
+                        "滑杆只影响她未来的变化方向，不会直接改她现在的样子；她也不会完全照着走。",
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
@@ -2210,17 +2456,6 @@ fun CharacterSettingsScreen(nav: NavHostController, characterId: String) {
                     TraitSlider("主动", prefInitiative) { prefInitiative = it }
                     TraitSlider("独立", prefIndependence) { prefIndependence = it }
                     TraitSlider("粘人", prefClinginess) { prefClinginess = it }
-                    Spacer(Modifier.height(10.dp))
-                    val gain = relationGain(intimacyDraft.roundToInt())
-                    Text(
-                        "当前对她（关系带来的变化只加在温柔、粘人、主动）",
-                        fontSize = 11.sp,
-                        color = c.muted
-                    )
-                    Spacer(Modifier.height(4.dp))
-                    TraitEcho("温柔", prefWarmth.roundToInt(), gain)
-                    TraitEcho("粘人", prefClinginess.roundToInt(), gain)
-                    TraitEcho("主动", prefInitiative.roundToInt(), gain)
                     Spacer(Modifier.height(6.dp))
                     Button(
                         onClick = {
@@ -2310,12 +2545,17 @@ fun CharacterSettingsScreen(nav: NavHostController, characterId: String) {
                                         AppGraph.db.memoryDao().deleteAll(characterId)
                                         AppGraph.db.relationshipDao().delete(characterId)
                                         AppGraph.db.personalityDao().delete(characterId)
+                                        AppGraph.db.personaHistoryDao().deleteAll(characterId)
                                         AppGraph.db.moodDao().delete(characterId)
                                         AppGraph.db.characterDao().delete(characterId)
                                         AppGraph.api.clearKeyFor(characterId)
                                         BehaviorSettings.resetIntimacyRaw(characterId)
                                         BehaviorSettings.resetIdlePenalty(characterId)
-                                        nav.popBackStack()
+                                        BehaviorSettings.resetMoodHold(characterId)
+                                        // 直接回到会话列表，避免停在已删除角色的聊天信息页
+                                        if (!nav.popBackStack("characters", false)) {
+                                            nav.navigate("characters")
+                                        }
                                     }
                                 }
                             )
@@ -2329,6 +2569,91 @@ fun CharacterSettingsScreen(nav: NavHostController, characterId: String) {
                 Spacer(Modifier.height(30.dp))
             }
         }
+    }
+
+    if (retemperOpen) {
+        AlertDialog(
+            onDismissRequest = { retemperOpen = false },
+            title = { Text("重新选择底色") },
+            text = {
+                Column {
+                    Text(
+                        "这会把她的底色换回原型值，现在的成长也一起归零。",
+                        fontSize = 13.sp,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                    Spacer(Modifier.height(8.dp))
+                    Temperaments.ALL.forEach { option ->
+                        val selected = retemperPick.name == option.name
+                        TextButton(
+                            onClick = { retemperPick = option },
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .clip(RoundedCornerShape(12.dp))
+                                .background(
+                                    if (selected) {
+                                        MaterialTheme.colorScheme.primary.copy(alpha = 0.12f)
+                                    } else {
+                                        Color.Transparent
+                                    }
+                                )
+                        ) {
+                            Text(
+                                if (selected) "✓ ${option.name}" else option.name,
+                                modifier = Modifier.fillMaxWidth()
+                            )
+                        }
+                    }
+                }
+            },
+            confirmButton = {
+                TextButton(onClick = {
+                    retemperOpen = false
+                    val picked = retemperPick
+                    confirm = ConfirmRequest(
+                        title = "确定换回「${picked.name}」？",
+                        body = "她现在的人格会被重置成这个底色，之后的成长重新开始。",
+                        secondBody = "这些年变化过的痕迹会清空，确定吗？",
+                        onConfirm = {
+                            scope.launch {
+                                val current = AppGraph.db.personalityDao().get(characterId)
+                                    ?: PersonalityEntity(characterId = characterId)
+                                AppGraph.db.personalityDao().upsert(
+                                    current.copy(
+                                        temperament = picked.name,
+                                        baseWarmth = picked.warmth,
+                                        baseLiveliness = picked.liveliness,
+                                        baseInitiative = picked.initiative,
+                                        baseIndependence = picked.independence,
+                                        baseClinginess = picked.clinginess,
+                                        warmth = picked.warmth,
+                                        liveliness = picked.liveliness,
+                                        initiative = picked.initiative,
+                                        independence = picked.independence,
+                                        clinginess = picked.clinginess,
+                                        prefWarmth = picked.warmth,
+                                        prefLiveliness = picked.liveliness,
+                                        prefInitiative = picked.initiative,
+                                        prefIndependence = picked.independence,
+                                        prefClinginess = picked.clinginess,
+                                        personaChanges = "",
+                                        lastPersonaChangeAt = 0L
+                                    )
+                                )
+                                AppGraph.db.personaHistoryDao().deleteAll(characterId)
+                                BehaviorSettings.setDriftState(characterId, "")
+                                prefWarmth = picked.warmth.toFloat()
+                                prefLiveliness = picked.liveliness.toFloat()
+                                prefInitiative = picked.initiative.toFloat()
+                                prefIndependence = picked.independence.toFloat()
+                                prefClinginess = picked.clinginess.toFloat()
+                            }
+                        }
+                    )
+                }) { Text("确定") }
+            },
+            dismissButton = { TextButton(onClick = { retemperOpen = false }) { Text("取消") } }
+        )
     }
 
     TwoStepConfirm(confirm, onDismiss = { confirm = null })
@@ -2355,10 +2680,17 @@ private fun TraitSlider(label: String, value: Float, onChange: (Float) -> Unit) 
 }
 
 @Composable
-private fun TraitEcho(label: String, base: Int, gain: Int) {
+private fun TraitEcho(label: String, base: Int, grown: Int, gains: Int) {
     val c = weChatColors()
+    val current = (grown + gains).coerceIn(0, 100)
+    val growth = grown - base
+    val detail = buildString {
+        append("底色 $base")
+        if (growth != 0) append(" · 成长 ${if (growth > 0) "+" else ""}$growth")
+        if (gains > 0) append(" · 关系 +$gains")
+    }
     Text(
-        "$label ${(base + gain).coerceAtMost(100)}（基线 $base + 关系 $gain）",
+        "$label $current（$detail）",
         fontSize = 12.sp,
         color = c.muted,
         modifier = Modifier.padding(vertical = 1.dp)
@@ -2377,9 +2709,28 @@ fun MeScreen(nav: NavHostController) {
     var model by remember { mutableStateOf(AppGraph.api.model) }
     var status by remember { mutableStateOf("") }
 
+    // 主动消息依赖通知，权限被拒时开关必须保持关闭
+    var proactiveOn by remember { mutableStateOf(BehaviorSettings.proactiveEnabled) }
+    val setProactive: (Boolean) -> Unit = { on ->
+        BehaviorSettings.updateProactiveEnabled(on)
+        proactiveOn = on
+    }
     val notificationPermission = rememberLauncherForActivityResult(
         ActivityResultContracts.RequestPermission()
-    ) { }
+    ) { granted ->
+        if (granted && notificationsEnabled(context)) {
+            setProactive(true)
+        } else {
+            setProactive(false)
+            Toast.makeText(context, "通知权限未开启，主动消息保持关闭", Toast.LENGTH_SHORT).show()
+        }
+    }
+    // 系统设置里关掉通知后，回到 App 时把主动消息一起关掉
+    OnResume {
+        if (proactiveOn && !notificationsEnabled(context)) {
+            setProactive(false)
+        }
+    }
 
     val exportLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.CreateDocument("application/zip")
@@ -2512,16 +2863,17 @@ fun MeScreen(nav: NavHostController) {
                             )
                         }
                         Switch(
-                            checked = BehaviorSettings.proactiveEnabled,
+                            checked = proactiveOn,
                             onCheckedChange = { on ->
-                                if (on) {
-                                    notificationPermission.launch(Manifest.permission.POST_NOTIFICATIONS)
+                                when {
+                                    !on -> setProactive(false)
+                                    notificationsEnabled(context) -> setProactive(true)
+                                    else -> notificationPermission.launch(Manifest.permission.POST_NOTIFICATIONS)
                                 }
-                                BehaviorSettings.updateProactiveEnabled(on)
                             }
                         )
                     }
-                    if (BehaviorSettings.proactiveEnabled) {
+                    if (proactiveOn) {
                         Text(
                             "空闲 ${BehaviorSettings.proactiveIdleHours} 小时后",
                             style = MaterialTheme.typography.bodySmall,

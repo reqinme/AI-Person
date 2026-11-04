@@ -31,7 +31,9 @@ data class CharacterEntity(
     @ColumnInfo(defaultValue = "0") val strongAlertAt: Long = 0L,
     @ColumnInfo(defaultValue = "''") val apiBaseUrl: String = "",
     @ColumnInfo(defaultValue = "''") val apiModel: String = "",
-    @ColumnInfo(defaultValue = "1") val vision: Boolean = true
+    @ColumnInfo(defaultValue = "1") val vision: Boolean = true,
+    /** 她后来对他改口的称呼；空字符串表示还叫「你」。 */
+    @ColumnInfo(defaultValue = "''") val nickname: String = ""
 )
 
 /** 聊天记录。visibleAt > 0 表示延迟消息，到点才显示。role 可为 user / assistant / system / note。 */
@@ -71,7 +73,7 @@ data class RelationshipEntity(
     val lastChatAt: Long = 0
 )
 
-/** 人格状态：当前值 + 用户设定的偏好值，演化只做软引导。 */
+/** 人格状态：当前值 + 底色（成长前的样子）+ 用户设定的偏好值。 */
 @Entity(tableName = "personality")
 data class PersonalityEntity(
     @PrimaryKey val characterId: String,
@@ -84,7 +86,27 @@ data class PersonalityEntity(
     val prefLiveliness: Int = 50,
     val prefInitiative: Int = 40,
     val prefIndependence: Int = 50,
-    val prefClinginess: Int = 30
+    val prefClinginess: Int = 30,
+    /** 底色原型名；旧角色迁移后是「自定义」。 */
+    @ColumnInfo(defaultValue = "'自定义'") val temperament: String = "自定义",
+    @ColumnInfo(defaultValue = "50") val baseWarmth: Int = 50,
+    @ColumnInfo(defaultValue = "50") val baseLiveliness: Int = 50,
+    @ColumnInfo(defaultValue = "40") val baseInitiative: Int = 40,
+    @ColumnInfo(defaultValue = "50") val baseIndependence: Int = 50,
+    @ColumnInfo(defaultValue = "30") val baseClinginess: Int = 30,
+    /** 这些年她变成什么样的叙述，换行分隔，只留最近几条。 */
+    @ColumnInfo(defaultValue = "''") val personaChanges: String = "",
+    @ColumnInfo(defaultValue = "0") val lastPersonaChangeAt: Long = 0L
+)
+
+/** 人设变化记录：一句她变成什么样 + 原因 + 时间。 */
+@Entity(tableName = "persona_history", indices = [Index("characterId")])
+data class PersonaChangeEntity(
+    @PrimaryKey(autoGenerate = true) val id: Long = 0,
+    val characterId: String,
+    val change: String,
+    @ColumnInfo(defaultValue = "''") val reason: String = "",
+    val createdAt: Long
 )
 
 /** 当前心情与耐心，影响语气、回不回、回多快。 */
@@ -108,21 +130,37 @@ const val DEFAULT_DISLIKES = "被欺骗、被敷衍\n被当成工具使唤\n被�
 
 /**
  * 关系增益：亲密度 50 以下为 0，50 → 100 平滑加到 20。
- * 只作用在温柔、粘人、主动三项，活泼和独立保持基线。
+ * 每个维度按自己的底色缩放：底色越接近，越容易因为关系而显出来。
  */
-fun relationGain(intimacy: Int): Int {
+fun relationGain(intimacy: Int, base: Int): Int {
     if (intimacy <= 50) return 0
-    return (((intimacy - 50) / 50f) * 20f).toInt().coerceIn(0, 20)
+    val affinity = 0.4f + (base.coerceIn(0, 100) / 100f) * 0.6f
+    return ((((intimacy - 50) / 50f) * 20f) * affinity).toInt().coerceIn(0, 20)
+}
+
+/** 三个会被关系放大的维度各自涨多少；独立会用来自我抵抗粘人的涨幅。 */
+data class RelationGains(val warmth: Int, val initiative: Int, val clinginess: Int)
+
+fun relationGains(personality: PersonalityEntity, intimacy: Int): RelationGains {
+    val warmth = relationGain(intimacy, personality.baseWarmth)
+    val initiative = relationGain(intimacy, personality.baseInitiative)
+    val rawCling = relationGain(intimacy, personality.baseClinginess)
+    val resistance = 1f - personality.baseIndependence.coerceIn(0, 100) / 200f
+    return RelationGains(
+        warmth = warmth,
+        initiative = initiative,
+        clinginess = (rawCling * resistance).toInt().coerceIn(0, 20)
+    )
 }
 
 /** 加上关系增益之后，她此刻实际呈现的人格。 */
 fun effectivePersonality(personality: PersonalityEntity, intimacy: Int): PersonalityEntity {
-    val gain = relationGain(intimacy)
-    if (gain == 0) return personality
+    val gains = relationGains(personality, intimacy)
+    if (gains.warmth == 0 && gains.initiative == 0 && gains.clinginess == 0) return personality
     return personality.copy(
-        warmth = (personality.warmth + gain).coerceIn(0, 100),
-        initiative = (personality.initiative + gain).coerceIn(0, 100),
-        clinginess = (personality.clinginess + gain).coerceIn(0, 100)
+        warmth = (personality.warmth + gains.warmth).coerceIn(0, 100),
+        initiative = (personality.initiative + gains.initiative).coerceIn(0, 100),
+        clinginess = (personality.clinginess + gains.clinginess).coerceIn(0, 100)
     )
 }
 
@@ -177,9 +215,9 @@ interface MessageDao {
     @Query("SELECT * FROM messages WHERE characterId = :characterId ORDER BY createdAt ASC, id ASC")
     fun observeAll(characterId: String): Flow<List<MessageEntity>>
 
-    /** 列表页预览：该角色最新一条消息。 */
-    @Query("SELECT * FROM messages WHERE characterId = :characterId ORDER BY createdAt DESC, id DESC LIMIT 1")
-    fun observeLast(characterId: String): Flow<MessageEntity?>
+    /** 列表页预览：取最近几条，由 UI 跳过还没到时间的延迟消息和空 note。 */
+    @Query("SELECT * FROM messages WHERE characterId = :characterId ORDER BY createdAt DESC, id DESC LIMIT :limit")
+    fun observeRecent(characterId: String, limit: Int): Flow<List<MessageEntity>>
 
     @Query("SELECT COUNT(*) FROM messages WHERE characterId = :characterId AND role IN ('user','assistant')")
     suspend fun countDialogue(characterId: String): Int
@@ -195,6 +233,11 @@ interface MessageDao {
 
     @Query("SELECT COUNT(*) FROM messages WHERE characterId = :characterId AND id > :afterId")
     suspend fun countAfter(characterId: String, afterId: Long): Int
+
+    @Query(
+        "SELECT COUNT(*) FROM messages WHERE characterId = :characterId AND createdAt >= :since AND role IN ('user','assistant')"
+    )
+    suspend fun countDialogueSince(characterId: String, since: Long): Int
 
     @Query("SELECT MAX(id) FROM messages WHERE characterId = :characterId")
     suspend fun latestId(characterId: String): Long?
@@ -248,6 +291,10 @@ interface MemoryDao {
     @Query("UPDATE memories SET importance = :importance, weight = :weight, lastRecalledAt = :recalledAt WHERE id = :id")
     suspend fun reinforce(id: Long, importance: Int, weight: Float, recalledAt: Long)
 
+    /** 召回即刷新：这一轮被想起的记忆重新回到满权重，从当下重新开始衰减。 */
+    @Query("UPDATE memories SET weight = importance, tier = 'ACTIVE', lastRecalledAt = :at WHERE id IN (:ids)")
+    suspend fun touchRecalled(ids: List<Long>, at: Long)
+
     @Query("UPDATE memories SET content = :content, importance = :importance, weight = :weight, tier = 'ACTIVE' WHERE id = :id")
     suspend fun edit(id: Long, content: String, importance: Int, weight: Float)
 
@@ -299,6 +346,9 @@ interface PersonalityDao {
     @Query("SELECT * FROM personality WHERE characterId = :characterId")
     suspend fun get(characterId: String): PersonalityEntity?
 
+    @Query("SELECT * FROM personality WHERE characterId = :characterId")
+    fun observe(characterId: String): Flow<PersonalityEntity?>
+
     @Query("SELECT * FROM personality")
     suspend fun all(): List<PersonalityEntity>
 
@@ -309,6 +359,30 @@ interface PersonalityDao {
     suspend fun delete(characterId: String)
 
     @Query("DELETE FROM personality")
+    suspend fun clear()
+}
+
+@Dao
+interface PersonaHistoryDao {
+    @Query("SELECT * FROM persona_history WHERE characterId = :characterId ORDER BY createdAt DESC")
+    fun observe(characterId: String): Flow<List<PersonaChangeEntity>>
+
+    @Query("SELECT * FROM persona_history WHERE characterId = :characterId ORDER BY createdAt DESC LIMIT :limit")
+    suspend fun recent(characterId: String, limit: Int): List<PersonaChangeEntity>
+
+    @Query("SELECT COUNT(*) FROM persona_history WHERE characterId = :characterId AND createdAt >= :since")
+    suspend fun countSince(characterId: String, since: Long): Int
+
+    @Insert
+    suspend fun insert(entry: PersonaChangeEntity): Long
+
+    @Query("SELECT * FROM persona_history")
+    suspend fun all(): List<PersonaChangeEntity>
+
+    @Query("DELETE FROM persona_history WHERE characterId = :characterId")
+    suspend fun deleteAll(characterId: String)
+
+    @Query("DELETE FROM persona_history")
     suspend fun clear()
 }
 
@@ -337,9 +411,10 @@ interface MoodDao {
         MemoryEntity::class,
         RelationshipEntity::class,
         PersonalityEntity::class,
+        PersonaChangeEntity::class,
         MoodEntity::class
     ],
-    version = 2,
+    version = 3,
     exportSchema = false
 )
 abstract class AppDatabase : RoomDatabase() {
@@ -348,6 +423,7 @@ abstract class AppDatabase : RoomDatabase() {
     abstract fun memoryDao(): MemoryDao
     abstract fun relationshipDao(): RelationshipDao
     abstract fun personalityDao(): PersonalityDao
+    abstract fun personaHistoryDao(): PersonaHistoryDao
     abstract fun moodDao(): MoodDao
 
     companion object {
@@ -379,12 +455,48 @@ abstract class AppDatabase : RoomDatabase() {
             }
         }
 
+        /**
+         * 2 -> 3：人格分底色与成长值，新增人设变化记录和称呼。
+         * 旧角色的底色取当前值（标成「自定义」），偏好夹回底色 ±15。
+         */
+        private val MIGRATION_2_3 = object : Migration(2, 3) {
+            override fun migrate(db: androidx.sqlite.db.SupportSQLiteDatabase) {
+                db.execSQL("ALTER TABLE characters ADD COLUMN nickname TEXT NOT NULL DEFAULT ''")
+                db.execSQL("ALTER TABLE personality ADD COLUMN temperament TEXT NOT NULL DEFAULT '自定义'")
+                db.execSQL("ALTER TABLE personality ADD COLUMN baseWarmth INTEGER NOT NULL DEFAULT 50")
+                db.execSQL("ALTER TABLE personality ADD COLUMN baseLiveliness INTEGER NOT NULL DEFAULT 50")
+                db.execSQL("ALTER TABLE personality ADD COLUMN baseInitiative INTEGER NOT NULL DEFAULT 40")
+                db.execSQL("ALTER TABLE personality ADD COLUMN baseIndependence INTEGER NOT NULL DEFAULT 50")
+                db.execSQL("ALTER TABLE personality ADD COLUMN baseClinginess INTEGER NOT NULL DEFAULT 30")
+                db.execSQL("ALTER TABLE personality ADD COLUMN personaChanges TEXT NOT NULL DEFAULT ''")
+                db.execSQL("ALTER TABLE personality ADD COLUMN lastPersonaChangeAt INTEGER NOT NULL DEFAULT 0")
+                db.execSQL("UPDATE personality SET baseWarmth = warmth, baseLiveliness = liveliness, " +
+                    "baseInitiative = initiative, baseIndependence = independence, baseClinginess = clinginess")
+                db.execSQL("UPDATE personality SET " +
+                    "prefWarmth = MIN(MAX(prefWarmth, baseWarmth - 15), baseWarmth + 15), " +
+                    "prefLiveliness = MIN(MAX(prefLiveliness, baseLiveliness - 15), baseLiveliness + 15), " +
+                    "prefInitiative = MIN(MAX(prefInitiative, baseInitiative - 15), baseInitiative + 15), " +
+                    "prefIndependence = MIN(MAX(prefIndependence, baseIndependence - 15), baseIndependence + 15), " +
+                    "prefClinginess = MIN(MAX(prefClinginess, baseClinginess - 15), baseClinginess + 15)")
+                db.execSQL(
+                    "CREATE TABLE IF NOT EXISTS persona_history (" +
+                        "id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL, " +
+                        "characterId TEXT NOT NULL, change TEXT NOT NULL, " +
+                        "reason TEXT NOT NULL DEFAULT '', createdAt INTEGER NOT NULL)"
+                )
+                db.execSQL(
+                    "CREATE INDEX IF NOT EXISTS index_persona_history_characterId " +
+                        "ON persona_history(characterId)"
+                )
+            }
+        }
+
         fun get(context: Context): AppDatabase = instance ?: synchronized(this) {
             instance ?: Room.databaseBuilder(
                 context.applicationContext,
                 AppDatabase::class.java,
                 "ai_person.db"
-            ).addMigrations(MIGRATION_1_2).fallbackToDestructiveMigration().build().also { instance = it }
+            ).addMigrations(MIGRATION_1_2, MIGRATION_2_3).fallbackToDestructiveMigration().build().also { instance = it }
         }
     }
 }

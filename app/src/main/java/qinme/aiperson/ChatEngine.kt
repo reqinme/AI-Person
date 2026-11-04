@@ -7,10 +7,14 @@ import androidx.work.ExistingWorkPolicy
 import androidx.work.OneTimeWorkRequestBuilder
 import androidx.work.WorkManager
 import androidx.work.WorkerParameters
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import org.json.JSONObject
 import java.util.concurrent.TimeUnit
+import kotlin.random.Random
 
 /**
  * 一轮完整的对话：写入用户消息 → 调模型（带回不回/延迟/心情/亲密度）→ 落库。
@@ -61,6 +65,10 @@ object ChatEngine {
                 }
                 .reversed()
             val memories = db.memoryDao().recall(characterId, BehaviorSettings.RECALL_LIMIT)
+            // 召回即刷新：这轮被想起的事从当下重新计算衰减
+            if (memories.isNotEmpty()) {
+                db.memoryDao().touchRecalled(memories.map { it.id }, now)
+            }
             val knownDays = ((now - character.createdAt) / TimeUnit.DAYS.toMillis(1)).toInt() + 1
             val totalMessages = db.messageDao().countDialogue(characterId)
 
@@ -95,13 +103,24 @@ object ChatEngine {
                 db.messageDao().setCaption(messageId, decision.caption.take(120))
             }
 
-            // 心情
-            val newMood = mood.copy(
-                mood = (decision.mood ?: mood.mood).coerceIn(0, 100),
-                patience = (decision.patience ?: mood.patience).coerceIn(0, 100),
-                updatedAt = now
+            // 心情有惯性：新心情 = 旧 70% + 这一轮 30%；刚吵完的 2-3 轮里只能往下，不能立刻回血
+            val hold = BehaviorSettings.moodHold(characterId)
+            val blendedMood = Math.round(mood.mood * 0.7f + (decision.mood ?: mood.mood) * 0.3f)
+            val blendedPatience = Math.round(mood.patience * 0.7f + (decision.patience ?: mood.patience) * 0.3f)
+            val nextMoodValue = if (hold > 0) minOf(blendedMood, mood.mood) else blendedMood
+            val nextPatienceValue = if (hold > 0) minOf(blendedPatience, mood.patience) else blendedPatience
+            db.moodDao().upsert(
+                mood.copy(
+                    mood = nextMoodValue.coerceIn(0, 100),
+                    patience = nextPatienceValue.coerceIn(0, 100),
+                    updatedAt = now
+                )
             )
-            db.moodDao().upsert(newMood)
+            if (decision.intimacyDelta <= -3) {
+                BehaviorSettings.setMoodHold(characterId, 3)
+            } else if (hold > 0) {
+                BehaviorSettings.setMoodHold(characterId, hold - 1)
+            }
 
             // 亲密度：显示封顶 100，但内部继续累计，避免刚到 100 就被一次踩线打下来
             // 打招呼、寒暄、嗯哦好这类没有信息量的话，不靠模型判断，直接不加分
@@ -115,6 +134,9 @@ object ChatEngine {
             val intimacy = nextRaw.coerceAtMost(100)
             BehaviorSettings.setIntimacyRaw(characterId, nextRaw)
             db.relationshipDao().upsert(relationship.copy(intimacy = intimacy, lastChatAt = now))
+
+            val smallTalk = isSmallTalk(text, imageName.isNotBlank())
+            val shown = effectivePersonality(personality, intimacy)
 
             when (decision.action) {
                 "silent" -> {
@@ -139,34 +161,122 @@ object ChatEngine {
                             createdAt = now + 1
                         )
                     )
-                    db.messageDao().insert(
-                        MessageEntity(
-                            characterId = characterId,
-                            role = "assistant",
-                            content = decision.reply,
-                            createdAt = target,
-                            visibleAt = target
-                        )
-                    )
-                    scheduleDelivery(target - now, characterId, decision.reply)
+                    insertReply(characterId, decision.reply, target, notify = true)
                 }
 
                 else -> {
                     val reply = decision.reply.ifBlank { "……" }
-                    db.messageDao().insert(
-                        MessageEntity(
-                            characterId = characterId,
-                            role = "assistant",
-                            content = reply,
-                            createdAt = System.currentTimeMillis()
+                    val naturalDelay = naturalDelayMinutes(shown, nextMoodValue, intimacy, smallTalk)
+                    if (naturalDelay > 0) {
+                        // 按性格慢半拍：清冷、忙、心情差的时候不会秒回
+                        val target = Timing.shortDelay(now, naturalDelay)
+                        db.messageDao().insert(
+                            MessageEntity(
+                                characterId = characterId,
+                                role = "note",
+                                content = "",
+                                createdAt = now + 1
+                            )
                         )
-                    )
+                        insertReply(characterId, reply, target, notify = true)
+                    } else {
+                        insertReply(characterId, reply, System.currentTimeMillis(), notify = false)
+                    }
                 }
             }
 
-            runCatching { GrowthEngine.maybeGrow(characterId) }
+            // 记忆压缩会再调一次模型，不能阻塞本轮发送；后台跑，失败下次再补
+            growthScope.launch { runCatching { GrowthEngine.maybeGrow(characterId) } }
             Result(true)
         }
+
+    private val growthScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+
+    /**
+     * 回复拆成一到三条气泡，第二条起错开一两秒，
+     * 像真人边想边发，而不是一口气甩一段。
+     */
+    private suspend fun insertReply(
+        characterId: String,
+        text: String,
+        firstAt: Long,
+        notify: Boolean
+    ) {
+        val bubbles = splitBubbles(text)
+        val now = System.currentTimeMillis()
+        bubbles.forEachIndexed { index, bubble ->
+            val at = if (firstAt <= now + 1_000L) {
+                now + 1_200L + index * 1_800L
+            } else {
+                firstAt + index * 1_800L
+            }
+            AppGraph.db.messageDao().insert(
+                MessageEntity(
+                    characterId = characterId,
+                    role = "assistant",
+                    content = bubble,
+                    createdAt = at,
+                    visibleAt = at
+                )
+            )
+        }
+        if (notify) {
+            val delay = (firstAt - now).coerceAtLeast(60_000L)
+            scheduleDelivery(delay, characterId, bubbles.joinToString(" "))
+        }
+    }
+
+    private fun splitBubbles(text: String): List<String> {
+        val trimmed = text.trim()
+        if (trimmed.isEmpty()) return listOf("……")
+        if (trimmed.length <= 20) return listOf(trimmed)
+
+        val pieces = trimmed.split(Regex("(?<=[。！？…!?~])|\\n"))
+            .map { it.trim() }
+            .filter { it.isNotEmpty() }
+        val segments = if (pieces.size <= 1) listOf(trimmed) else pieces
+
+        val bubbles = mutableListOf<String>()
+        var buffer = ""
+        segments.forEach { piece ->
+            if (buffer.isEmpty()) {
+                buffer = piece
+            } else if ((buffer + piece).length <= 26 && bubbles.size < 2) {
+                buffer += piece
+            } else {
+                bubbles.add(buffer)
+                buffer = piece
+            }
+        }
+        if (buffer.isNotEmpty()) bubbles.add(buffer)
+
+        val result = if (bubbles.size > 3) {
+            bubbles.take(2) + bubbles.drop(2).joinToString("")
+        } else {
+            bubbles
+        }
+        return result.ifEmpty { listOf(trimmed) }
+    }
+
+    /** 按性格决定隔多久才回：清冷最慢，粘人最快；心情和关系再微调。 */
+    private fun naturalDelayMinutes(
+        personality: PersonalityEntity,
+        mood: Int,
+        intimacy: Int,
+        smallTalk: Boolean
+    ): Int {
+        var value = when {
+            personality.independence >= 70 || personality.warmth < 40 -> 5 + Random.nextInt(0, 16)
+            personality.clinginess >= 65 -> Random.nextInt(0, 3)
+            personality.liveliness >= 65 -> 1 + Random.nextInt(0, 5)
+            else -> 1 + Random.nextInt(0, 8)
+        }
+        if (mood <= 35) value += 5
+        if (mood >= 70) value -= 2
+        if (intimacy >= 80) value -= 2
+        if (smallTalk) value += 2
+        return value.coerceIn(0, 20)
+    }
 
     /** 招呼、寒暄、附和：这类话不增加亲密度。带图片的一律不算。 */
     private fun isSmallTalk(text: String, hasImage: Boolean): Boolean {
@@ -239,6 +349,7 @@ object ChatEngine {
         val request = OneTimeWorkRequestBuilder<DelayedDeliveryWorker>()
             .setInitialDelay(delayMs.coerceAtLeast(60_000L), TimeUnit.MILLISECONDS)
             .setInputData(data)
+            .addTag("deliver_$characterId")
             .build()
         runCatching {
             WorkManager.getInstance(context)
@@ -255,6 +366,7 @@ class DelayedDeliveryWorker(
 ) : CoroutineWorker(context, params) {
 
     override suspend fun doWork(): Result {
+        AppGraph.init(applicationContext)
         val characterId = inputData.getString("characterId") ?: return Result.success()
         val text = inputData.getString("text") ?: return Result.success()
         if (AppForeground.visible) return Result.success()

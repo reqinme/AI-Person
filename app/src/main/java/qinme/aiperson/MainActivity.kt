@@ -22,7 +22,10 @@ class MainActivity : ComponentActivity() {
         BehaviorSettings.init(this)
         Speaker.init(this)
         Notifier.ensureChannels(this)
-        pendingCharacterId = intent?.getStringExtra("characterId")
+        // 只在首次创建时消费通知里的角色，旋转/重建时不要重复导航
+        if (savedInstanceState == null) {
+            pendingCharacterId = intent?.getStringExtra("characterId")
+        }
 
         ProactiveScheduler.ensureScheduled(this)
         lifecycleScope.launch { MemoryDecay.run() }

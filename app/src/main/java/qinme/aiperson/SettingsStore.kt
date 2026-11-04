@@ -30,6 +30,7 @@ object BehaviorSettings {
         private set
 
     fun init(context: Context) {
+        if (::prefs.isInitialized) return
         prefs = context.getSharedPreferences("behavior_prefs", Context.MODE_PRIVATE)
         compressionInterval = prefs.getInt("compression_interval", 8)
         proactiveEnabled = prefs.getBoolean("proactive_enabled", false)
@@ -132,6 +133,37 @@ object BehaviorSettings {
         prefs.edit().putString("last_kind_$characterId", kind).apply()
     }
 
+    /** 上次主动找他的时间，用来按性格拉开间隔，而不是每天固定发一条。 */
+    fun lastProactiveAt(characterId: String): Long =
+        prefs.getLong("last_proactive_$characterId", 0L)
+
+    fun setLastProactiveAt(characterId: String, at: Long) {
+        prefs.edit().putLong("last_proactive_$characterId", at).apply()
+    }
+
+    /**
+     * 心情惯性：冲突后还剩几轮不恢复。
+     * 大于 0 时，这一轮心情只能往下走，不能立刻回升。
+     */
+    fun moodHold(characterId: String): Int = prefs.getInt("mood_hold_$characterId", 0)
+
+    fun setMoodHold(characterId: String, rounds: Int) {
+        prefs.edit().putInt("mood_hold_$characterId", rounds.coerceAtLeast(0)).apply()
+    }
+
+    /** 底色慢漂移的累计证据（JSON 字符串，由 GrowthEngine 解释）。 */
+    fun driftState(characterId: String): String =
+        prefs.getString("drift_state_$characterId", "").orEmpty()
+
+    fun setDriftState(characterId: String, value: String) {
+        prefs.edit().putString("drift_state_$characterId", value).apply()
+    }
+
+    fun resetMoodHold(characterId: String) {
+        prefs.edit().remove("mood_hold_$characterId").remove("drift_state_$characterId")
+            .remove("last_proactive_$characterId").apply()
+    }
+
     // 记忆衰减参数（固定默认值）
     const val HALF_LIFE_DAYS = 14.0
     const val DEGRADE_THRESHOLD = 2.0f
@@ -149,6 +181,12 @@ object Timing {
 
     fun clampDelay(now: Long, minutes: Int): Long {
         val target = now + minutes.coerceIn(10, MAX_DELAY_MINUTES) * 60_000L
+        return pushOutOfQuiet(target)
+    }
+
+    /** 按性格的短延迟，几秒到二十分钟，不强制十分钟起步。 */
+    fun shortDelay(now: Long, minutes: Int): Long {
+        val target = now + minutes.coerceIn(0, 20) * 60_000L
         return pushOutOfQuiet(target)
     }
 
