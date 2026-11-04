@@ -320,6 +320,10 @@ object Backup {
         .put("apiModel", apiModel)
         .put("vision", vision)
         .put("nickname", nickname)
+        .put("identity", identity)
+        .put("background", background)
+        .put("catchphrase", catchphrase)
+        .put("memeLevel", memeLevel)
 
     private fun JSONObject.toCharacter() = CharacterEntity(
         id = getString("id"),
@@ -336,7 +340,11 @@ object Backup {
         apiBaseUrl = optString("apiBaseUrl", ""),
         apiModel = optString("apiModel", ""),
         vision = optBoolean("vision", true),
-        nickname = optString("nickname", "")
+        nickname = optString("nickname", ""),
+        identity = optString("identity", ""),
+        background = optString("background", ""),
+        catchphrase = optString("catchphrase", ""),
+        memeLevel = optInt("memeLevel", 50)
     )
 
     private fun MessageEntity.toJson() = JSONObject()

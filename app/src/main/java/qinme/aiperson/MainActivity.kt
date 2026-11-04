@@ -20,7 +20,6 @@ class MainActivity : ComponentActivity() {
         AppGraph.init(this)
         UiPrefs.init(this)
         BehaviorSettings.init(this)
-        Speaker.init(this)
         Notifier.ensureChannels(this)
         // 只在首次创建时消费通知里的角色，旋转/重建时不要重复导航
         if (savedInstanceState == null) {

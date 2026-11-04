@@ -2,9 +2,7 @@ package qinme.aiperson
 
 import android.Manifest
 import android.content.Context
-import android.content.pm.PackageManager
 import android.net.Uri
-import android.speech.SpeechRecognizer
 import android.widget.Toast
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.PickVisualMediaRequest
@@ -13,7 +11,6 @@ import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
-import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.foundation.layout.*
@@ -30,7 +27,6 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.ArrowBack
 import androidx.compose.material.icons.filled.ChatBubble
-import androidx.compose.material.icons.filled.Mic
 import androidx.compose.material.icons.filled.MoreHoriz
 import androidx.compose.material.icons.filled.Person
 import androidx.compose.material.icons.filled.Search
@@ -46,7 +42,6 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.vector.ImageVector
-import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalLifecycleOwner
@@ -58,7 +53,6 @@ import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.app.NotificationManagerCompat
-import androidx.core.content.ContextCompat
 import androidx.core.content.FileProvider
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
@@ -589,7 +583,11 @@ private suspend fun createCharacter(
     dislikes: String,
     accent: Int,
     avatarPath: String,
-    temperament: Temperament
+    temperament: Temperament,
+    identity: String,
+    background: String,
+    catchphrase: String,
+    memeLevel: Int
 ) {
     val id = UUID.randomUUID().toString()
     AppGraph.db.characterDao().upsert(
@@ -601,7 +599,11 @@ private suspend fun createCharacter(
             accentColor = accent,
             createdAt = System.currentTimeMillis(),
             dislikes = dislikes.ifBlank { DEFAULT_DISLIKES },
-            avatarPath = avatarPath
+            avatarPath = avatarPath,
+            identity = identity,
+            background = background,
+            catchphrase = catchphrase,
+            memeLevel = memeLevel
         )
     )
     AppGraph.db.relationshipDao().upsert(RelationshipEntity(characterId = id))
@@ -709,10 +711,14 @@ fun CharacterListScreen(nav: NavHostController) {
     if (showCreate) {
         CreateCharacterDialog(
             onDismiss = { showCreate = false },
-            onCreate = { name, gender, persona, dislikes, accent, avatar, temperament ->
+            onCreate = { name, gender, persona, dislikes, accent, avatar, temperament,
+                         identity, background, catchphrase, memeLevel ->
                 showCreate = false
                 scope.launch {
-                    createCharacter(name, gender, persona, dislikes, accent, avatar, temperament)
+                    createCharacter(
+                        name, gender, persona, dislikes, accent, avatar, temperament,
+                        identity, background, catchphrase, memeLevel
+                    )
                 }
             }
         )
@@ -803,9 +809,27 @@ private fun ConversationRow(character: CharacterEntity, nav: NavHostController, 
 }
 
 @Composable
+private fun SliderRow(label: String, value: Float, onChange: (Float) -> Unit) {
+    Row(verticalAlignment = Alignment.CenterVertically) {
+        Text(
+            "$label ${value.roundToInt()}",
+            fontSize = 12.sp,
+            modifier = Modifier.width(72.dp)
+        )
+        Slider(
+            value = value,
+            onValueChange = onChange,
+            valueRange = 0f..100f,
+            modifier = Modifier.weight(1f)
+        )
+    }
+}
+
+@Composable
 private fun CreateCharacterDialog(
     onDismiss: () -> Unit,
-    onCreate: (String, String, String, String, Int, String, Temperament) -> Unit
+    onCreate: (String, String, String, String, Int, String, Temperament,
+               String, String, String, Int) -> Unit
 ) {
     var name by remember { mutableStateOf("") }
     var gender by remember { mutableStateOf("女") }
@@ -816,6 +840,16 @@ private fun CreateCharacterDialog(
     var dislikesEdited by remember { mutableStateOf(false) }
     var accent by remember { mutableStateOf(ACCENTS.first()) }
     var avatar by remember { mutableStateOf("") }
+    var identity by remember { mutableStateOf("") }
+    var background by remember { mutableStateOf("") }
+    var catchphrase by remember { mutableStateOf("") }
+    var memeLevel by remember { mutableStateOf(50f) }
+    var customBase by remember { mutableStateOf(false) }
+    var warmth by remember { mutableStateOf(55f) }
+    var liveliness by remember { mutableStateOf(55f) }
+    var initiative by remember { mutableStateOf(50f) }
+    var independence by remember { mutableStateOf(50f) }
+    var clinginess by remember { mutableStateOf(45f) }
     val pickAvatar = rememberMediaPicker(ImageStore.Kind.AVATAR) { avatar = it }
 
     AlertDialog(
@@ -868,9 +902,10 @@ private fun CreateCharacterDialog(
                     horizontalArrangement = Arrangement.spacedBy(6.dp)
                 ) {
                     Temperaments.ALL.forEach { option ->
-                        val selected = temperament.name == option.name
+                        val selected = !customBase && temperament.name == option.name
                         TextButton(
                             onClick = {
+                                customBase = false
                                 temperament = option
                                 if (!personaEdited) persona = option.hint
                                 if (!dislikesEdited) dislikes = option.dislikes
@@ -893,12 +928,39 @@ private fun CreateCharacterDialog(
                                 )
                         ) { Text(option.name) }
                     }
+                    TextButton(
+                        onClick = { customBase = true },
+                        colors = ButtonDefaults.textButtonColors(
+                            contentColor = if (customBase) {
+                                MaterialTheme.colorScheme.primary
+                            } else {
+                                MaterialTheme.colorScheme.onSurfaceVariant
+                            }
+                        ),
+                        modifier = Modifier
+                            .clip(RoundedCornerShape(12.dp))
+                            .background(
+                                if (customBase) {
+                                    MaterialTheme.colorScheme.primary.copy(alpha = 0.12f)
+                                } else {
+                                    Color.Transparent
+                                }
+                            )
+                    ) { Text("自定义") }
                 }
-                Text(
-                    temperament.style,
-                    fontSize = 11.sp,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant
-                )
+                if (customBase) {
+                    SliderRow("温暖", warmth, { warmth = it })
+                    SliderRow("活泼", liveliness, { liveliness = it })
+                    SliderRow("主动", initiative, { initiative = it })
+                    SliderRow("独立", independence, { independence = it })
+                    SliderRow("粘人", clinginess, { clinginess = it })
+                } else {
+                    Text(
+                        temperament.style,
+                        fontSize = 11.sp,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
                 Spacer(Modifier.height(10.dp))
                 OutlinedTextField(
                     value = persona,
@@ -921,6 +983,45 @@ private fun CreateCharacterDialog(
                     modifier = Modifier.fillMaxWidth()
                 )
                 Spacer(Modifier.height(12.dp))
+                OutlinedTextField(
+                    value = identity,
+                    onValueChange = { identity = it.take(60) },
+                    label = { Text("她是谁、在做什么（可留空）") },
+                    placeholder = { Text("比如：插画师，一个人住，养了只猫") },
+                    modifier = Modifier.fillMaxWidth()
+                )
+                Spacer(Modifier.height(12.dp))
+                OutlinedTextField(
+                    value = background,
+                    onValueChange = { background = it.take(120) },
+                    label = { Text("她的来历（可留空）") },
+                    placeholder = { Text("比如：小城市长大，大学才来这边，换过两次工作") },
+                    modifier = Modifier.fillMaxWidth()
+                )
+                Spacer(Modifier.height(12.dp))
+                OutlinedTextField(
+                    value = catchphrase,
+                    onValueChange = { catchphrase = it.take(60) },
+                    label = { Text("说话习惯 / 口头禅（可留空）") },
+                    placeholder = { Text("比如：爱说「行吧」；生气时不叫人全名") },
+                    modifier = Modifier.fillMaxWidth()
+                )
+                Spacer(Modifier.height(6.dp))
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text(
+                        "玩梗程度",
+                        fontSize = 12.sp,
+                        modifier = Modifier.width(72.dp)
+                    )
+                    Slider(
+                        value = memeLevel,
+                        onValueChange = { memeLevel = it },
+                        valueRange = 0f..100f,
+                        modifier = Modifier.weight(1f)
+                    )
+                    Text(memeLevel.roundToInt().toString(), fontSize = 12.sp)
+                }
+                Spacer(Modifier.height(12.dp))
                 Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
                     ACCENTS.forEach { color ->
                         Box(
@@ -942,8 +1043,24 @@ private fun CreateCharacterDialog(
         confirmButton = {
             TextButton(
                 onClick = {
+                    val chosen = if (customBase) {
+                        Temperament(
+                            name = "自定义",
+                            warmth = warmth.roundToInt(),
+                            liveliness = liveliness.roundToInt(),
+                            initiative = initiative.roundToInt(),
+                            independence = independence.roundToInt(),
+                            clinginess = clinginess.roundToInt(),
+                            style = "你的性格是你自己长成的，不套任何模板；说话方式按人设和口头禅来。",
+                            hint = persona,
+                            dislikes = dislikes
+                        )
+                    } else {
+                        temperament
+                    }
                     onCreate(
-                        name.trim(), gender, persona.trim(), dislikes.trim(), accent, avatar, temperament
+                        name.trim(), gender, persona.trim(), dislikes.trim(), accent, avatar, chosen,
+                        identity.trim(), background.trim(), catchphrase.trim(), memeLevel.roundToInt()
                     )
                 },
                 enabled = name.isNotBlank()
@@ -1098,7 +1215,6 @@ fun ChatScreen(nav: NavHostController, characterId: String) {
 
     var input by remember { mutableStateOf("") }
     var sending by remember { mutableStateOf(false) }
-    var voiceActive by remember { mutableStateOf(false) }
     var selectedImage by remember { mutableStateOf("") }
     var showPlus by remember { mutableStateOf(false) }
     var previewImage by remember { mutableStateOf<String?>(null) }
@@ -1110,33 +1226,8 @@ fun ChatScreen(nav: NavHostController, characterId: String) {
     val listState = rememberLazyListState()
     val accent = character?.accentColor?.let { Color(it) } ?: c.accent
 
-    val speech = remember {
-        SpeechInput(context, onPartial = { input = it }, onFinal = { input = it })
-    }
-    DisposableEffect(Unit) {
-        onDispose {
-            speech.destroy()
-            Speaker.stop()
-        }
-    }
-
-    val recordPermission = rememberLauncherForActivityResult(
-        ActivityResultContracts.RequestPermission()
-    ) { granted ->
-        if (granted) {
-            voiceActive = true
-            speech.start()
-        }
-    }
-
     val pickImage = rememberMediaPicker(ImageStore.Kind.CHAT) { selectedImage = it }
     val takePhoto = rememberCameraCapture { selectedImage = it }
-
-    LaunchedEffect(characterId) {
-        AppGraph.db.personalityDao().get(characterId)?.let {
-            Speaker.tune(it.liveliness, it.clinginess)
-        }
-    }
 
     LaunchedEffect(Unit) {
         while (true) {
@@ -1207,12 +1298,7 @@ fun ChatScreen(nav: NavHostController, characterId: String) {
         scope.launch {
             sending = true
             try {
-                val result = ChatEngine.send(characterId, text, image)
-                if (result.ok && BehaviorSettings.autoSpeak) {
-                    AppGraph.db.messageDao().recent(characterId, 1)
-                        .firstOrNull { it.role == "assistant" && it.visibleAt == 0L }
-                        ?.let { Speaker.speak(it.content) }
-                }
+                ChatEngine.send(characterId, text, image)
             } finally {
                 sending = false
             }
@@ -1267,7 +1353,6 @@ fun ChatScreen(nav: NavHostController, characterId: String) {
                             isRead = message.id in readIds,
                             highlighted = flashId == message.id,
                             accent = accent,
-                            onSpeak = { Speaker.speak(it) },
                             onImageClick = { previewImage = it }
                         )
                     }
@@ -1348,42 +1433,6 @@ fun ChatScreen(nav: NavHostController, characterId: String) {
                         cursorBrush = SolidColor(c.accent),
                         maxLines = 4,
                         modifier = Modifier.fillMaxWidth()
-                    )
-                }
-                Spacer(Modifier.width(6.dp))
-                Box(
-                    Modifier
-                        .size(38.dp)
-                        .clip(CircleShape)
-                        .background(if (voiceActive) accent.copy(alpha = 0.22f) else c.inputBar)
-                        .border(1.dp, c.highlight, CircleShape)
-                        .pointerInput(Unit) {
-                            detectTapGestures(
-                                onPress = {
-                                    if (!SpeechRecognizer.isRecognitionAvailable(context)) return@detectTapGestures
-                                    val granted = ContextCompat.checkSelfPermission(
-                                        context,
-                                        Manifest.permission.RECORD_AUDIO
-                                    ) == PackageManager.PERMISSION_GRANTED
-                                    if (!granted) {
-                                        recordPermission.launch(Manifest.permission.RECORD_AUDIO)
-                                        return@detectTapGestures
-                                    }
-                                    voiceActive = true
-                                    speech.start()
-                                    tryAwaitRelease()
-                                    speech.stop()
-                                    voiceActive = false
-                                }
-                            )
-                        },
-                    contentAlignment = Alignment.Center
-                ) {
-                    Icon(
-                        Icons.Filled.Mic,
-                        contentDescription = "按住说话",
-                        tint = if (voiceActive) accent else c.text,
-                        modifier = Modifier.size(20.dp)
                     )
                 }
                 if (input.isNotBlank() || selectedImage.isNotBlank()) {
@@ -1508,7 +1557,6 @@ private fun MessageRow(
     isRead: Boolean,
     highlighted: Boolean,
     accent: Color,
-    onSpeak: (String) -> Unit,
     onImageClick: (String) -> Unit
 ) {
     val c = weChatColors()
@@ -1619,16 +1667,6 @@ private fun MessageRow(
                     color = c.text
                 )
                 Row(Modifier.padding(top = 3.dp, start = 2.dp), verticalAlignment = Alignment.CenterVertically) {
-                    Text(
-                        "朗读",
-                        fontSize = 9.sp,
-                        color = c.accent,
-                        modifier = Modifier
-                            .clip(RoundedCornerShape(4.dp))
-                            .clickable { onSpeak(message.content) }
-                            .padding(horizontal = 4.dp, vertical = 2.dp)
-                    )
-                    Spacer(Modifier.width(4.dp))
                     Text(
                         timeText(message.visibleAt.takeIf { it > 0 } ?: message.createdAt),
                         fontSize = 9.sp,
@@ -2059,6 +2097,10 @@ fun CharacterSettingsScreen(nav: NavHostController, characterId: String) {
     var personality by remember { mutableStateOf<PersonalityEntity?>(null) }
     var confirm by remember { mutableStateOf<ConfirmRequest?>(null) }
     var dislikesDraft by remember { mutableStateOf("") }
+    var identityDraft by remember { mutableStateOf("") }
+    var backgroundDraft by remember { mutableStateOf("") }
+    var catchphraseDraft by remember { mutableStateOf("") }
+    var memeDraft by remember { mutableFloatStateOf(50f) }
     var intimacyDraft by remember { mutableFloatStateOf(0f) }
     var prefWarmth by remember { mutableFloatStateOf(50f) }
     var prefLiveliness by remember { mutableFloatStateOf(50f) }
@@ -2085,6 +2127,10 @@ fun CharacterSettingsScreen(nav: NavHostController, characterId: String) {
         dislikeMemories = AppGraph.db.memoryDao().countTag(characterId, "dislike")
         AppGraph.db.characterDao().get(characterId)?.let { current ->
             dislikesDraft = current.dislikes
+            identityDraft = current.identity
+            backgroundDraft = current.background
+            catchphraseDraft = current.catchphrase
+            memeDraft = current.memeLevel.toFloat()
             baseUrl = current.apiBaseUrl
             model = current.apiModel
             vision = current.vision
@@ -2249,6 +2295,43 @@ fun CharacterSettingsScreen(nav: NavHostController, characterId: String) {
 
                 Spacer(Modifier.height(12.dp))
                 GlassCard(Modifier.fillMaxWidth(), accent = accent) {
+                    Text("她的基础设定", style = MaterialTheme.typography.titleSmall)
+                    Spacer(Modifier.height(8.dp))
+                    OutlinedTextField(
+                        value = identityDraft,
+                        onValueChange = { identityDraft = it.take(60) },
+                        modifier = Modifier.fillMaxWidth(),
+                        label = { Text("她是谁、在做什么") },
+                        placeholder = { Text("比如：插画师，一个人住，养了只猫") }
+                    )
+                    Spacer(Modifier.height(8.dp))
+                    OutlinedTextField(
+                        value = backgroundDraft,
+                        onValueChange = { backgroundDraft = it.take(120) },
+                        modifier = Modifier.fillMaxWidth(),
+                        label = { Text("她的来历") },
+                        placeholder = { Text("比如：小城市长大，大学才来这边，换过两次工作") }
+                    )
+                    Spacer(Modifier.height(8.dp))
+                    OutlinedTextField(
+                        value = catchphraseDraft,
+                        onValueChange = { catchphraseDraft = it.take(60) },
+                        modifier = Modifier.fillMaxWidth(),
+                        label = { Text("说话习惯 / 口头禅") },
+                        placeholder = { Text("比如：爱说「行吧」；生气时不叫人全名") }
+                    )
+                    Spacer(Modifier.height(6.dp))
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Text("玩梗程度", fontSize = 12.sp, modifier = Modifier.width(72.dp))
+                        Slider(
+                            value = memeDraft,
+                            onValueChange = { memeDraft = it },
+                            valueRange = 0f..100f,
+                            modifier = Modifier.weight(1f)
+                        )
+                        Text(memeDraft.roundToInt().toString(), fontSize = 12.sp)
+                    }
+                    Spacer(Modifier.height(12.dp))
                     Text("她讨厌 / 不能接受的事", style = MaterialTheme.typography.titleSmall)
                     Spacer(Modifier.height(8.dp))
                     OutlinedTextField(
@@ -2280,7 +2363,13 @@ fun CharacterSettingsScreen(nav: NavHostController, characterId: String) {
                                     scope.launch {
                                         AppGraph.db.characterDao().get(characterId)?.let {
                                             AppGraph.db.characterDao().upsert(
-                                                it.copy(dislikes = dislikesDraft.trim())
+                                                it.copy(
+                                                    dislikes = dislikesDraft.trim(),
+                                                    identity = identityDraft.trim(),
+                                                    background = backgroundDraft.trim(),
+                                                    catchphrase = catchphraseDraft.trim(),
+                                                    memeLevel = memeDraft.roundToInt()
+                                                )
                                             )
                                         }
                                     }
@@ -2707,6 +2796,8 @@ fun MeScreen(nav: NavHostController) {
     var baseUrl by remember { mutableStateOf(AppGraph.api.baseUrl) }
     var apiKey by remember { mutableStateOf(AppGraph.api.apiKey) }
     var model by remember { mutableStateOf(AppGraph.api.model) }
+    var searchUrl by remember { mutableStateOf(AppGraph.api.searchUrl) }
+    var searchKey by remember { mutableStateOf(AppGraph.api.searchKey) }
     var status by remember { mutableStateOf("") }
 
     // 主动消息依赖通知，权限被拒时开关必须保持关闭
@@ -2817,12 +2908,38 @@ fun MeScreen(nav: NavHostController) {
                         visualTransformation = PasswordVisualTransformation(),
                         modifier = Modifier.fillMaxWidth()
                     )
+                    Spacer(Modifier.height(14.dp))
+                    Text("联网搜索（可选）", style = MaterialTheme.typography.titleSmall)
+                    Text(
+                        "她只在自己觉得需要查的时候才搜，日常聊天不会联网。留空则不启用。",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                    Spacer(Modifier.height(8.dp))
+                    OutlinedTextField(
+                        value = searchUrl,
+                        onValueChange = { searchUrl = it },
+                        label = { Text("搜索接口（Tavily 格式）") },
+                        singleLine = true,
+                        modifier = Modifier.fillMaxWidth()
+                    )
+                    Spacer(Modifier.height(8.dp))
+                    OutlinedTextField(
+                        value = searchKey,
+                        onValueChange = { searchKey = it },
+                        label = { Text("搜索 Key（可留空）") },
+                        singleLine = true,
+                        visualTransformation = PasswordVisualTransformation(),
+                        modifier = Modifier.fillMaxWidth()
+                    )
                     Spacer(Modifier.height(8.dp))
                     Button(
                         onClick = {
                             AppGraph.api.baseUrl = baseUrl
                             AppGraph.api.model = model
                             AppGraph.api.apiKey = apiKey
+                            AppGraph.api.searchUrl = searchUrl
+                            AppGraph.api.searchKey = searchKey
                             status = "默认接口已保存"
                         },
                         modifier = Modifier.align(Alignment.End)
@@ -2900,23 +3017,8 @@ fun MeScreen(nav: NavHostController) {
                 }
 
                 Spacer(Modifier.height(16.dp))
-                SectionLabel("外观与声音")
+                SectionLabel("外观")
                 GlassCard(Modifier.fillMaxWidth()) {
-                    Row(verticalAlignment = Alignment.CenterVertically) {
-                        Column(Modifier.weight(1f)) {
-                            Text("自动朗读", style = MaterialTheme.typography.titleSmall)
-                            Text(
-                                "她回复后自动念出来",
-                                style = MaterialTheme.typography.bodySmall,
-                                color = MaterialTheme.colorScheme.onSurfaceVariant
-                            )
-                        }
-                        Switch(
-                            checked = BehaviorSettings.autoSpeak,
-                            onCheckedChange = { BehaviorSettings.updateAutoSpeak(it) }
-                        )
-                    }
-                    Spacer(Modifier.height(10.dp))
                     Row(verticalAlignment = Alignment.CenterVertically) {
                         Column(Modifier.weight(1f)) {
                             Text("显示成长数值", style = MaterialTheme.typography.titleSmall)
@@ -2982,6 +3084,8 @@ fun MeScreen(nav: NavHostController) {
                     AboutLine("会遗忘", "记忆先变模糊，再被删除；重要的会被反复想起。")
                     AboutLine("有边界", "她有自己的底线和情绪，可以不回你、可以生气。")
                     AboutLine("真实节奏", "不是每句都秒回，延迟和沉默都是她的一部分。")
+                    AboutLine("会查", "遇到新闻和实时信息才自己查一下，平时不联网。")
+                    AboutLine("会玩梗", "网感按角色设定，克制使用，不硬凑。")
                     AboutLine("记忆闭合", "记忆默认锁住，查看或修改需要两次确认。")
                     AboutLine("数据在本地", "聊天、记忆、图片都存在这台手机上。")
                     AboutLine("Key 加密", "接口密钥由系统 Keystore 加密，按角色分开存。")
@@ -2989,7 +3093,11 @@ fun MeScreen(nav: NavHostController) {
                     AboutLine("许可", "AI Person 非商业源码开放协议 1.0")
                     Spacer(Modifier.height(6.dp))
                     Text(
-                        "AI Person 0.3.1",
+                        "AI Person " + runCatching {
+                            context.packageManager
+                                .getPackageInfo(context.packageName, 0)
+                                .versionName
+                        }.getOrNull().orEmpty(),
                         style = MaterialTheme.typography.labelSmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant
                     )

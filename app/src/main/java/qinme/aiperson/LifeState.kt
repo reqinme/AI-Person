@@ -1,7 +1,6 @@
 package qinme.aiperson
 
 import java.util.Calendar
-import java.util.concurrent.TimeUnit
 
 /**
  * 她自己的日常。
@@ -76,14 +75,23 @@ object LifeState {
         "今天夜里安静下来，脑子反而有点乱"
     )
 
+    /** 网上冲浪看到的东西，给她一点“最近大家都在说”的素材。 */
+    private val netPool = listOf(
+        "今天刷到一个烂梗，笑了半天，其实也没什么好笑的",
+        "今天刷短视频刷到一条特别抽象的，评论区比视频还好看",
+        "今天看到大家都在讨论一个剧，你没看，只记住了几个梗",
+        "今天刷到有人吵架吵上热搜，你看了两眼就划走了",
+        "今天在网上看到一个说法，觉得挺对，又觉得挺矫情"
+    )
+
     /** 今天过得怎么样，全天固定一句。 */
     fun today(characterId: String, ts: Long = System.currentTimeMillis()): String {
         val cal = Calendar.getInstance().apply { timeInMillis = ts }
         val weekend = isWeekend(cal)
         val pool = if (weekend) {
-            morningWeekend + noonWeekend + afternoonWeekend + eveningWeekend
+            morningWeekend + noonWeekend + afternoonWeekend + eveningWeekend + netPool
         } else {
-            morningWeekday + noonWeekday + afternoonWeekday + eveningWeekday
+            morningWeekday + noonWeekday + afternoonWeekday + eveningWeekday + netPool
         }
         return pick(key(characterId, ts, "today", weekend), pool)
     }
@@ -110,7 +118,9 @@ object LifeState {
     }
 
     private fun key(characterId: String, ts: Long, tag: String, vararg extra: Any): String {
-        val day = ts / TimeUnit.DAYS.toMillis(1)
+        // 用本地日期，不能用 UTC 天数，否则“今天”会在早上八点换掉
+        val cal = Calendar.getInstance().apply { timeInMillis = ts }
+        val day = cal.get(Calendar.YEAR) * 1000 + cal.get(Calendar.DAY_OF_YEAR)
         return "$characterId|$day|$tag|${extra.joinToString(":")}"
     }
 

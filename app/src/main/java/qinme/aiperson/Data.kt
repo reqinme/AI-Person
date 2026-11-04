@@ -33,7 +33,15 @@ data class CharacterEntity(
     @ColumnInfo(defaultValue = "''") val apiModel: String = "",
     @ColumnInfo(defaultValue = "1") val vision: Boolean = true,
     /** 她后来对他改口的称呼；空字符串表示还叫「你」。 */
-    @ColumnInfo(defaultValue = "''") val nickname: String = ""
+    @ColumnInfo(defaultValue = "''") val nickname: String = "",
+    /** 她的身份/在做什么，比如「插画师，独居」。 */
+    @ColumnInfo(defaultValue = "''") val identity: String = "",
+    /** 她自己的来历，会影响她怎么看待事情。 */
+    @ColumnInfo(defaultValue = "''") val background: String = "",
+    /** 口头禅或固定说法，几句话就够。 */
+    @ColumnInfo(defaultValue = "''") val catchphrase: String = "",
+    /** 玩梗程度 0-100；越高越爱用网络梗，但不是每句都用。 */
+    @ColumnInfo(defaultValue = "50") val memeLevel: Int = 50
 )
 
 /** 聊天记录。visibleAt > 0 表示延迟消息，到点才显示。role 可为 user / assistant / system / note。 */
@@ -414,7 +422,7 @@ interface MoodDao {
         PersonaChangeEntity::class,
         MoodEntity::class
     ],
-    version = 3,
+    version = 4,
     exportSchema = false
 )
 abstract class AppDatabase : RoomDatabase() {
@@ -491,12 +499,23 @@ abstract class AppDatabase : RoomDatabase() {
             }
         }
 
+        /** 3 -> 4：角色可以自己写身份、来历、口头禅，并调玩梗程度。 */
+        private val MIGRATION_3_4 = object : Migration(3, 4) {
+            override fun migrate(db: androidx.sqlite.db.SupportSQLiteDatabase) {
+                db.execSQL("ALTER TABLE characters ADD COLUMN identity TEXT NOT NULL DEFAULT ''")
+                db.execSQL("ALTER TABLE characters ADD COLUMN background TEXT NOT NULL DEFAULT ''")
+                db.execSQL("ALTER TABLE characters ADD COLUMN catchphrase TEXT NOT NULL DEFAULT ''")
+                db.execSQL("ALTER TABLE characters ADD COLUMN memeLevel INTEGER NOT NULL DEFAULT 50")
+            }
+        }
+
         fun get(context: Context): AppDatabase = instance ?: synchronized(this) {
             instance ?: Room.databaseBuilder(
                 context.applicationContext,
                 AppDatabase::class.java,
                 "ai_person.db"
-            ).addMigrations(MIGRATION_1_2, MIGRATION_2_3).fallbackToDestructiveMigration().build().also { instance = it }
+            ).addMigrations(MIGRATION_1_2, MIGRATION_2_3, MIGRATION_3_4)
+                .fallbackToDestructiveMigration().build().also { instance = it }
         }
     }
 }

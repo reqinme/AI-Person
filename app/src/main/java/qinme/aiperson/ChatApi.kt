@@ -55,6 +55,17 @@ class ApiSettings(context: Context) {
         get() = prefs.getString("model", DEFAULT_MODEL) ?: DEFAULT_MODEL
         set(value) = prefs.edit().putString("model", value.trim()).apply()
 
+    /** 联网搜索（Tavily 格式）；留空则不启用。 */
+    var searchUrl: String
+        get() = prefs.getString("search_url", DEFAULT_SEARCH_URL) ?: DEFAULT_SEARCH_URL
+        set(value) = prefs.edit().putString("search_url", value.trim()).apply()
+
+    var searchKey: String
+        get() = prefs.getString("search_key", "") ?: ""
+        set(value) = prefs.edit().putString("search_key", value.trim()).apply()
+
+    val searchConfigured: Boolean get() = searchKey.isNotBlank()
+
     val configured: Boolean get() = apiKey.isNotBlank()
 
     /** 角色自己的 Key，没填就用默认 Key。 */
@@ -79,6 +90,7 @@ class ApiSettings(context: Context) {
     companion object {
         const val DEFAULT_BASE_URL = "https://api.deepseek.com/v1"
         const val DEFAULT_MODEL = "deepseek-chat"
+        const val DEFAULT_SEARCH_URL = "https://api.tavily.com/search"
     }
 }
 
@@ -236,6 +248,29 @@ object PromptBuilder {
         } else {
             "你平时直接叫他「你」，偶尔连名带姓叫，看当时的心情。"
         }
+        val identity = character.identity
+            .trim()
+            .takeIf { it.isNotBlank() }
+            ?.let { "你的身份和现在的生活：$it" }
+            ?: ""
+        val background = character.background
+            .trim()
+            .takeIf { it.isNotBlank() }
+            ?.let { "你的来历（不用主动交代，但会影响你怎么看事情）：$it" }
+            ?: ""
+        val catchphrase = character.catchphrase
+            .trim()
+            .takeIf { it.isNotBlank() }
+            ?.let { "你说话的口癖和习惯：$it。别每句都用，偶尔冒出来才像真的。" }
+            ?: ""
+        val meme = when {
+            character.memeLevel >= 70 ->
+                "你网感很重，平时爱刷短视频和帖子，聊天时会顺手抛一个当下流行的梗；但不是每句都玩，也不会为了玩梗硬拐。"
+            character.memeLevel >= 40 ->
+                "你偶尔用网络梗，觉得合适才用，不会为了显得年轻硬塞。"
+            else ->
+                "你不太用网络流行语，最多听别人说过，聊天更偏自己的说法。"
+        }
         val grown = if (changes.isNotBlank()) {
             "这些年，别人能看出来你变了：$changes。变化很小，但确实还在。"
         } else {
@@ -248,7 +283,8 @@ object PromptBuilder {
         return """
             你就是「${character.name}」，一个真实的人，不是 AI 助手，不要客服腔，不要自称 AI。
             你的性格：${character.persona}
-            你的底色：${raw.temperament}。${style}
+            ${if (identity.isNotBlank()) "$identity\n" else ""}${if (background.isNotBlank()) "$background\n" else ""}${if (catchphrase.isNotBlank()) "$catchphrase\n" else ""}你的底色：${raw.temperament}。${style}
+            $meme
             $grown
             $nickname
             你的底线（一旦被踩到，你会真的不高兴）：
@@ -380,6 +416,11 @@ object PromptBuilder {
         11. 少用重复句式，不要每句都带问号，不要连续追问同一个问题。
         12. 偶尔主动提一句你自己的事（今天遇到什么、在吃什么、被谁气到），但不要编造夸张剧情。
         13. 称呼按上面写的那样自然用，不要每句都带称呼，也不要解释称呼。
+        14. 网络梗按你的网感程度来。一条消息最多一个梗，连续几条不要重复同一个；
+            过气、拿不准、或者对方明显不懂的梗不要硬用。玩梗是为了好笑，不是为了显得年轻。
+        15. 不确定的事实不要编。遇到新闻、价格、新发布、你记不清的具体信息，
+            你会想查一下；查不到就坦白说不知道。上下文里如果已经给了资料，
+            就当自己本来知道，绝不要提"搜索""查到""根据资料"。
 
         底线规则（最重要）：
         - 上面列出的底线是硬约束。用户如果踩到（欺骗、敷衍、把他当工具使唤、无视他的感受等），
@@ -395,10 +436,13 @@ object PromptBuilder {
         - delay_minutes 要符合你现在的状态：忙、烦、在通勤时可以久一点；闲着就快一点。
 
         只输出一个 JSON 对象，不要 markdown、不要代码块、不要注释、不要任何额外文字：
-        {"action":"reply","delay_minutes":0,"reply":"你要说的话","image_caption":"","mood":55,"patience":55,"intimacy_delta":1}
+        {"action":"reply","delay_minutes":0,"search":"","reply":"你要说的话","image_caption":"","mood":55,"patience":55,"intimacy_delta":1}
         字段说明：
         - action：reply 正常回 / delay 过一会儿回 / silent 不回
         - delay_minutes：仅 delay 用，10 到 360 的整数
+        - search：只有你真的需要查一下才填搜索词（新闻、实时价格、新发布、你确定不了的具体事实），
+          一句短查询即可；日常聊天、情绪、寒暄、你本来就知道的事，一律填空字符串。
+          不是每句都搜，绝大多数轮次应该是空的。
         - reply：你要说的话；silent 时为空字符串
         - image_caption：如果用户这轮发了图片，用一句第三人称描述图里有什么；没图填空字符串
         - mood、patience：0 到 100，这轮对话之后你的心情和耐心
@@ -424,6 +468,53 @@ object PromptBuilder {
         如果是求助，要具体（比如请他帮你选东西、帮你想个办法），不要空泛。
         不要用"打扰一下""有空吗"这种陌生人才会用的开场。
     """.trimIndent()
+}
+
+/** 按需联网搜索：只有她自己觉得需要查一下时才调用。 */
+object SearchApi {
+    private val http = OkHttpClient.Builder()
+        .connectTimeout(15, TimeUnit.SECONDS)
+        .readTimeout(30, TimeUnit.SECONDS)
+        .build()
+
+    suspend fun query(text: String, max: Int = 3): String? = withContext(Dispatchers.IO) {
+        val settings = AppGraph.api
+        val key = settings.searchKey
+        if (key.isBlank()) return@withContext null
+        val url = settings.searchUrl.ifBlank { ApiSettings.DEFAULT_SEARCH_URL }
+        val body = JSONObject()
+            .put("api_key", key)
+            .put("query", text.take(120))
+            .put("max_results", max)
+            .put("include_answer", true)
+        val request = Request.Builder()
+            .url(url)
+            .addHeader("Authorization", "Bearer $key")
+            .post(body.toString().toRequestBody("application/json".toMediaType()))
+            .build()
+        runCatching {
+            http.newCall(request).execute().use { response ->
+                val raw = response.body?.string().orEmpty()
+                if (!response.isSuccessful) return@use null
+                val json = JSONObject(raw)
+                val answer = json.optString("answer", "").trim()
+                val lines = mutableListOf<String>()
+                if (answer.isNotBlank()) lines += answer
+                val results = json.optJSONArray("results")
+                if (results != null) {
+                    for (i in 0 until results.length()) {
+                        val item = results.optJSONObject(i) ?: continue
+                        val title = item.optString("title", "").trim()
+                        val content = item.optString("content", "").trim()
+                        if (content.isNotBlank()) {
+                            lines += if (title.isBlank()) content else "$title：$content"
+                        }
+                    }
+                }
+                lines.distinct().joinToString("\n").take(1200).ifBlank { null }
+            }
+        }.getOrNull()
+    }
 }
 
 /** 全局依赖容器。 */

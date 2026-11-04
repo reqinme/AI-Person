@@ -85,7 +85,7 @@ class ProactiveWorker(
             db.memoryDao().touchRecalled(memories.map { it.id }, now)
         }
 
-        val kind = pickKind(target.personality, character.id)
+        val kind = pickKind(target.shown, character.id)
         val knownDays = ((now - character.createdAt) / TimeUnit.DAYS.toMillis(1)).toInt() + 1
         val totalMessages = db.messageDao().countDialogue(character.id)
         val system = PromptBuilder.proactive(

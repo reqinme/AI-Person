@@ -21,7 +21,10 @@ import kotlin.random.Random
  */
 object ChatEngine {
 
-    data class Result(val ok: Boolean, val error: String? = null)
+    data class Result(
+        val ok: Boolean,
+        val error: String? = null
+    )
 
     private data class Decision(
         val action: String,
@@ -30,7 +33,9 @@ object ChatEngine {
         val caption: String,
         val mood: Int?,
         val patience: Int?,
-        val intimacyDelta: Int
+        val intimacyDelta: Int,
+        /** 她这一轮想查的东西；空字符串表示不用查。 */
+        val search: String = ""
     )
 
     suspend fun send(characterId: String, text: String, imageName: String = ""): Result =
@@ -96,7 +101,20 @@ object ChatEngine {
                 return@withContext Result(false, e.message ?: "连接失败")
             }
 
-            val decision = parse(raw)
+            val decision = parse(raw).let { first ->
+                // 只在她自己觉得需要查的时候才多走一趟；没配搜索就跳过
+                if (first.search.isBlank() || !AppGraph.api.searchConfigured) return@let first
+                val found = SearchApi.query(first.search) ?: return@let first
+                val extra = """
+                    补充资料（你刚查到的。不要提来源、不要说"我查了一下"，
+                    就像你本来就知道这些，用你自己的方式说出来）：
+                    $found
+                    请据此重新输出这一轮的完整 JSON，search 保持空字符串。
+                """.trimIndent()
+                runCatching { Llm.complete(character, system + "\n\n" + extra, history, temperature = 0.8) }
+                    .map { parse(it).copy(search = "") }
+                    .getOrElse { first }
+            }
 
             // 图片描述记在用户那条消息上，后续记忆压缩会用到
             if (imageName.isNotBlank() && decision.caption.isNotBlank()) {
@@ -180,7 +198,9 @@ object ChatEngine {
                         )
                         insertReply(characterId, reply, target, notify = true)
                     } else {
-                        insertReply(characterId, reply, System.currentTimeMillis(), notify = false)
+                        insertReply(
+                            characterId, reply, System.currentTimeMillis(), notify = false
+                        )
                     }
                 }
             }
@@ -332,11 +352,12 @@ object ChatEngine {
         val patience = json.optInt("patience", -1).takeIf { it in 0..100 }
         val delta = json.optInt("intimacy_delta", 1).coerceIn(-5, 5)
         val minutes = json.optInt("delay_minutes", 15)
+        val search = json.optString("search", "").trim().take(120)
 
         return if (action == "reply" && reply.isBlank()) {
-            Decision("silent", 0, "", caption, mood, patience, delta)
+            Decision("silent", 0, "", caption, mood, patience, delta, search)
         } else {
-            Decision(action, minutes, reply, caption, mood, patience, delta)
+            Decision(action, minutes, reply, caption, mood, patience, delta, search)
         }
     }
 

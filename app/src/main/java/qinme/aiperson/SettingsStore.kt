@@ -9,7 +9,7 @@ import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
 
-/** 行为设置：压缩间隔、主动消息、语音等。默认值即产品默认值。 */
+/** 行为设置：压缩间隔、主动消息等。默认值即产品默认值。 */
 object BehaviorSettings {
     private lateinit var prefs: SharedPreferences
 
@@ -25,10 +25,6 @@ object BehaviorSettings {
     var proactiveDailyCap by mutableStateOf(1)
         private set
 
-    // 语音
-    var autoSpeak by mutableStateOf(false)
-        private set
-
     fun init(context: Context) {
         if (::prefs.isInitialized) return
         prefs = context.getSharedPreferences("behavior_prefs", Context.MODE_PRIVATE)
@@ -36,7 +32,6 @@ object BehaviorSettings {
         proactiveEnabled = prefs.getBoolean("proactive_enabled", false)
         proactiveIdleHours = prefs.getInt("proactive_idle_hours", 12)
         proactiveDailyCap = prefs.getInt("proactive_daily_cap", 1)
-        autoSpeak = prefs.getBoolean("auto_speak", false)
     }
 
     fun updateCompressionInterval(value: Int) {
@@ -57,11 +52,6 @@ object BehaviorSettings {
     fun updateProactiveDailyCap(value: Int) {
         proactiveDailyCap = value.coerceIn(1, 3)
         prefs.edit().putInt("proactive_daily_cap", proactiveDailyCap).apply()
-    }
-
-    fun updateAutoSpeak(value: Boolean) {
-        autoSpeak = value
-        prefs.edit().putBoolean("auto_speak", value).apply()
     }
 
     // 每个角色上次做记忆压缩时的消息 id
@@ -187,6 +177,18 @@ object Timing {
     /** 按性格的短延迟，几秒到二十分钟，不强制十分钟起步。 */
     fun shortDelay(now: Long, minutes: Int): Long {
         val target = now + minutes.coerceIn(0, 20) * 60_000L
+        // 人还醒着，只是这几分钟跨进了静默点：压在静默前回，不要拖到第二天早上
+        if (!inQuietHours(now) && inQuietHours(target)) {
+            val cal = java.util.Calendar.getInstance().apply {
+                timeInMillis = now
+                set(java.util.Calendar.HOUR_OF_DAY, BehaviorSettings.QUIET_START_HOUR)
+                set(java.util.Calendar.MINUTE, 0)
+                set(java.util.Calendar.SECOND, 0)
+                set(java.util.Calendar.MILLISECOND, 0)
+            }
+            val before = cal.timeInMillis - 60_000L
+            if (before > now) return before
+        }
         return pushOutOfQuiet(target)
     }
 

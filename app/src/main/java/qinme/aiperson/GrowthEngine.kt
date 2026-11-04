@@ -46,7 +46,9 @@ object GrowthEngine {
 
         val transcript = db.messageDao().recent(characterId, needed * 2)
             .filter {
-                (it.role == "user" || it.role == "assistant") &&
+                // 只喂给模型上次整理之后的新消息，避免同一段对话反复影响人格
+                it.id > lastId &&
+                    (it.role == "user" || it.role == "assistant") &&
                     (it.visibleAt == 0L || it.visibleAt <= System.currentTimeMillis())
             }
             .reversed()
