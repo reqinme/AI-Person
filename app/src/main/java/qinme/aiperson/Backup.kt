@@ -327,6 +327,7 @@ object Backup {
         .put("innerState", innerState)
         .put("innerAt", innerAt)
         .put("routine", routine)
+        .put("routineDetail", routineDetail)
 
     private fun JSONObject.toCharacter() = CharacterEntity(
         id = getString("id"),
@@ -350,7 +351,8 @@ object Backup {
         memeLevel = optInt("memeLevel", 50),
         innerState = optString("innerState", ""),
         innerAt = optLong("innerAt", 0),
-        routine = optString("routine", "")
+        routine = optString("routine", ""),
+        routineDetail = optString("routineDetail", "")
     )
 
     private fun MessageEntity.toJson() = JSONObject()

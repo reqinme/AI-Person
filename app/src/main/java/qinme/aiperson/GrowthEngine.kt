@@ -5,7 +5,6 @@ import kotlinx.coroutines.withContext
 import org.json.JSONObject
 import java.util.concurrent.TimeUnit
 import kotlin.math.pow
-import kotlin.random.Random
 
 /**
  * 成长管线：每 N 轮压缩一次记忆、演化人格；亲密度已在每轮对话中判定。
@@ -197,21 +196,28 @@ object GrowthEngine {
         val current = personality ?: PersonalityEntity(characterId = characterId)
         val based = growBase(characterId, current, delta)
         val updated = based.copy(
-            warmth = drift(based.warmth, based.prefWarmth, based.baseWarmth, delta.optInt("warmth", 0)),
-            liveliness = drift(based.liveliness, based.prefLiveliness, based.baseLiveliness, delta.optInt("liveliness", 0)),
-            initiative = drift(based.initiative, based.prefInitiative, based.baseInitiative, delta.optInt("initiative", 0)),
-            independence = drift(based.independence, based.prefIndependence, based.baseIndependence, delta.optInt("independence", 0)),
-            clinginess = drift(based.clinginess, based.prefClinginess, based.baseClinginess, delta.optInt("clinginess", 0))
+            warmth = drift(based.warmth, based.baseWarmth, delta.optInt("warmth", 0)),
+            liveliness = drift(based.liveliness, based.baseLiveliness, delta.optInt("liveliness", 0)),
+            initiative = drift(based.initiative, based.baseInitiative, delta.optInt("initiative", 0)),
+            independence = drift(based.independence, based.baseIndependence, delta.optInt("independence", 0)),
+            clinginess = drift(based.clinginess, based.baseClinginess, delta.optInt("clinginess", 0))
         )
+        val moved = updated.warmth != based.warmth ||
+            updated.liveliness != based.liveliness ||
+            updated.initiative != based.initiative ||
+            updated.independence != based.independence ||
+            updated.clinginess != based.clinginess
         AppGraph.db.personalityDao().upsert(updated)
-        evolvePersona(characterId, character, updated, json)
+        evolvePersona(characterId, character, updated, json, moved)
     }
 
-    /** 当前值只在小范围里随对话晃动：模型方向 + 往偏好 8% 的拉力 + 一点噪声。 */
-    private fun drift(current: Int, pref: Int, base: Int, delta: Int): Int {
-        val pull = Math.round((pref - current) * 0.08f)
-        val noise = Random.nextInt(-1, 2)
-        val moved = current + delta.coerceIn(-2, 2) + pull + noise
+    /**
+     * 性格只在模型判出方向时动：没有噪声，也不会自己往回拉。
+     * 模型给 0 就一点都不动，给方向就最多一步。
+     */
+    private fun drift(current: Int, base: Int, delta: Int): Int {
+        if (delta == 0) return current
+        val moved = current + delta.coerceIn(-1, 1)
         val low = maxOf(0, base - 15)
         val high = minOf(100, base + 15)
         return moved.coerceIn(low, high)
@@ -274,26 +280,27 @@ object GrowthEngine {
     }
 
     /**
-     * 人设变化：至少 7 天、至少 40 条新消息、30 天内最多 2 条。
-     * 变化本身由模型写成一句叙述，这里只做闸门和落库。
+     * 人设变化：至少 7 天、30 天内最多 2 条。
+     * 只有性格数值真的动了，或者模型写出了变化，才允许记一笔；
+     * 不再用消息条数卡住，避免"数字变了、文案说没变"。
      */
     private suspend fun evolvePersona(
         characterId: String,
         character: CharacterEntity,
         personality: PersonalityEntity,
-        json: JSONObject
+        json: JSONObject,
+        moved: Boolean
     ) {
         val persona = json.optJSONObject("persona") ?: return
         val change = persona.optString("change", "").trim().take(40)
         val reason = persona.optString("reason", "").trim().take(24)
         val nickname = persona.optString("nickname", "").trim().take(8)
-        if (change.length < 4 && nickname.isBlank()) return
+        if (!moved && change.length < 4 && nickname.isBlank()) return
 
         val db = AppGraph.db
         val now = System.currentTimeMillis()
         val lastAt = personality.lastPersonaChangeAt.takeIf { it > 0 } ?: character.createdAt
         if (now - lastAt < TimeUnit.DAYS.toMillis(7)) return
-        if (db.messageDao().countDialogueSince(characterId, lastAt) < 40) return
         if (db.personaHistoryDao().countSince(characterId, now - TimeUnit.DAYS.toMillis(30)) >= 2) return
 
         var updated = personality

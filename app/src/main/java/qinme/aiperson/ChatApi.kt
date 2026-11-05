@@ -299,6 +299,11 @@ object PromptBuilder {
             .takeIf { it.isNotBlank() }
             ?.let { "你的来历（不用主动交代，但会影响你怎么看事情）：$it" }
             ?: ""
+        val routineDetail = character.routineDetail
+            .trim()
+            .takeIf { it.isNotBlank() }
+            ?.let { "你自己的日子（不用汇报，但你会按这个节奏生活）：$it" }
+            ?: ""
         val catchphrase = character.catchphrase
             .trim()
             .takeIf { it.isNotBlank() }
@@ -324,7 +329,7 @@ object PromptBuilder {
         return """
             你就是「${character.name}」，一个真实的人，不是 AI 助手，不要客服腔，不要自称 AI。
             你的性格：${character.persona}
-            ${if (identity.isNotBlank()) "$identity\n" else ""}${if (background.isNotBlank()) "$background\n" else ""}${if (catchphrase.isNotBlank()) "$catchphrase\n" else ""}你的底色：${raw.temperament}。${style}
+            ${if (identity.isNotBlank()) "$identity\n" else ""}${if (background.isNotBlank()) "$background\n" else ""}${if (routineDetail.isNotBlank()) "$routineDetail\n" else ""}${if (catchphrase.isNotBlank()) "$catchphrase\n" else ""}你的底色：${raw.temperament}。${style}
             $meme
             $grown
             $nickname
@@ -451,25 +456,41 @@ object PromptBuilder {
         appendLine()
     }
 
-    /** 帮她补全现实生活：身份、来历、作息。结果只填进输入框，由用户确认后再存。 */
-    fun fillLife(character: CharacterEntity): String = """
-        你在帮一个角色补全她的现实生活，让她像真人一样有自己的日子，而不是围着用户转。
+    /**
+     * 帮她补全现实生活：身份、来历、作息。
+     * 读的是输入框里当前写的内容，不是已保存的旧设定——这样先写"大学生"再点补全，方向就不会跑。
+     */
+    fun fillLife(
+        name: String,
+        persona: String,
+        identity: String,
+        background: String,
+        routineDetail: String
+    ): String = """
+        你在帮一个角色补全她的现实生活。方向由用户已经写下的身份决定，你只负责在同一个方向上往下补，
+        不能替她换职业、换年龄、换生活轨迹。
 
         已知信息：
-        名字：${character.name}
-        性格：${character.persona}
-        身份：${character.identity.ifBlank { "（还没写）" }}
-        来历：${character.background.ifBlank { "（还没写）" }}
+        名字：$name
+        性格：$persona
+        身份：${identity.trim().ifBlank { "（还没写，需要你定一个）" }}
+        来历：${background.trim().ifBlank { "（还没写）" }}
+        她每天怎么过：${routineDetail.trim().ifBlank { "（还没写）" }}
 
         只输出一个 JSON 对象，不要 markdown、不要解释：
-        {"identity":"她是谁、在做什么，30 字以内","background":"她怎么长成现在这样，60 字以内","routine":"worker|student|freelance|night|none"}
+        {"identity":"她是谁、在做什么，40 字以内","background":"她怎么长成现在这样，120 字以内","routine":"worker|student|freelance|night|none","routineDetail":"她一天大概怎么过，80 字以内"}
 
         规则：
-        1. 顺着已有信息补，不要推翻用户写过的内容；没写的部分才补。
-        2. 要具体、可信，有职业细节和生活质感，但不要写成小说。
-        3. routine 选最贴近她生活的一个：worker 上班族，student 学生，freelance 自由职业，night 夜班，none 没固定。
-        4. 不要编造和用户的亲密关系、共同经历，也不要写"她很爱用户"这类话。
-        5. 不要用"温柔""善良"这种空词，写具体的生活。
+        1. 用户写了身份，就原样返回那个身份，不要改写、不要升级、不要改成另一个行业。
+           身份是"大学生"就还是大学生，你补的是专业、年级、住哪、有没有课和实习。
+           只有身份是空白时，才按性格替她定一个。
+        2. 用户写了来历，就保留原意，只在后面补充细节；不要重写。
+        3. routineDetail 用她自己的口吻写一天：几点起、在哪、做什么、什么时候闲着、周末怎么过。
+           必须和身份对得上，不要套"朝九晚五"这种和她无关的模板。
+        4. routine 只是给程序一个大概，选最贴近她的：worker 上班族，student 学生，
+           freelance 自由职业，night 夜班，none 没固定。
+        5. 不要编造和用户的亲密关系、共同经历，也不要写"她很爱用户"这类话。
+        6. 不要用"温柔""善良"这种空词，写具体的生活细节。
     """.trimIndent()
 
     fun chat(
@@ -482,8 +503,16 @@ object PromptBuilder {
         totalMessages: Int = 0,
         inner: String = "",
         asleep: Boolean = false,
-        life: Routine.Moment? = null
+        life: Routine.Moment? = null,
+        missedHours: Int = 0
     ): String = base(character, relationship, personality, mood, memories, knownDays, totalMessages, inner) +
+        (if (missedHours > 0) """
+            他这条消息是 $missedHours 小时前发的，那会儿你已经睡了，刚刚才看到。
+            不要答成"当时就看见了"：也别把问题当成刚发生的。
+            可以顺口说一句"昨晚睡着了""刚看到"，然后按现在的时间回答；
+            如果问的是"睡了吗"这种过时的问题，就直接说已经睡醒了，别答"还没睡"。
+
+        """.trimIndent() else "") +
         (if (asleep) """
             现在是深夜，你已经睡了。
             他这条是夜里发的，你是刚醒才看到，不是当时在线回的。

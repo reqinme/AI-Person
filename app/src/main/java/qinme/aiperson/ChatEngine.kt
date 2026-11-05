@@ -81,9 +81,48 @@ object ChatEngine {
                 if (tickets[characterId]?.get() != ticket) return@withLock Result(true)
                 // 她还没发出去的延迟回复作废，新的一轮统一重答
                 db.messageDao().dropPendingReplies(characterId, System.currentTimeMillis())
+
+                // 睡着的时候不生成回复：凌晨写的句子挪到早上发，必然牛头不对马嘴
+                val personality = db.personalityDao().get(characterId)
+                    ?: PersonalityEntity(characterId = characterId)
+                val shown = effectivePersonality(personality, relationship.intimacy)
+                val routine = db.characterDao().get(characterId)?.routine.orEmpty()
+                if (Timing.isAsleep(now, characterId, shown, routine)) {
+                    scheduleWakeReply(
+                        characterId, Timing.nextWake(now, characterId, shown, routine)
+                    )
+                    return@withLock Result(true)
+                }
+
                 generateTurn(characterId, messageId, text, imageName)
             }
         }
+
+    /** 她睡醒了，把夜里没回的消息补上；这时才真正生成。 */
+    suspend fun wakeReply(characterId: String): Result = withContext(Dispatchers.IO) {
+        val db = AppGraph.db
+        val character = db.characterDao().get(characterId) ?: return@withContext Result(false)
+        val relationship = db.relationshipDao().get(characterId)
+            ?: RelationshipEntity(characterId = characterId)
+        val personality = db.personalityDao().get(characterId)
+            ?: PersonalityEntity(characterId = characterId)
+        val shown = effectivePersonality(personality, relationship.intimacy)
+        val now = System.currentTimeMillis()
+        if (Timing.isAsleep(now, characterId, shown, character.routine)) {
+            scheduleWakeReply(
+                characterId, Timing.nextWake(now, characterId, shown, character.routine)
+            )
+            return@withContext Result(true)
+        }
+        // 最新一条已经是她说的话，就不用再补了
+        val last = db.messageDao().recent(characterId, 5)
+            .firstOrNull { it.role == "user" || it.role == "assistant" }
+        if (last == null || last.role != "user") return@withContext Result(true)
+
+        locks.getOrPut(characterId) { Mutex() }.withLock {
+            generateTurn(characterId, last.id, last.content, last.imagePath)
+        }
+    }
 
     private suspend fun generateTurn(
         characterId: String,
@@ -131,6 +170,10 @@ object ChatEngine {
             val wakeAt = if (asleep) Timing.nextWake(now, character.id, shownNow, routine) else 0L
             // 此刻在做什么、忙不忙、昨晚睡够没有
             val life = Routine.moment(now, character.id, shownNow, routine)
+            // 这条消息是不是她睡着时发的：醒来后要当成「昨晚看到的」，不能答成当时在线
+            val triggerAt = db.messageDao().recent(characterId, 10)
+                .firstOrNull { it.id == messageId }?.createdAt ?: now
+            val missedHours = ((now - triggerAt) / TimeUnit.HOURS.toMillis(1)).toInt()
 
             val system = PromptBuilder.chat(
                 character,
@@ -142,7 +185,8 @@ object ChatEngine {
                 totalMessages,
                 inner,
                 asleep,
-                life
+                life,
+                missedHours
             )
 
             val raw = try {
@@ -466,6 +510,21 @@ object ChatEngine {
         }
     }
 
+    private fun scheduleWakeReply(characterId: String, wakeAt: Long) {
+        val context = AppGraph.appContext
+        val delayMs = (wakeAt - System.currentTimeMillis()).coerceAtLeast(60_000L)
+        val request = OneTimeWorkRequestBuilder<WakeReplyWorker>()
+            .setInitialDelay(delayMs, TimeUnit.MILLISECONDS)
+            .setInputData(Data.Builder().putString("characterId", characterId).build())
+            .addTag("wake_$characterId")
+            .build()
+        runCatching {
+            WorkManager.getInstance(context).enqueueUniqueWork(
+                "wake_reply_$characterId", ExistingWorkPolicy.REPLACE, request
+            )
+        }
+    }
+
     private fun scheduleDelivery(delayMs: Long, characterId: String, text: String) {
         val context = AppGraph.appContext
         val data = Data.Builder()
@@ -498,6 +557,20 @@ class DelayedDeliveryWorker(
         if (AppForeground.visible) return Result.success()
         val character = AppGraph.db.characterDao().get(characterId) ?: return Result.success()
         Notifier.post(applicationContext, character, text)
+        return Result.success()
+    }
+}
+
+/** 睡醒之后才生成回复，不让凌晨的情绪和句子拖到早上。 */
+class WakeReplyWorker(
+    context: Context,
+    params: WorkerParameters
+) : CoroutineWorker(context, params) {
+
+    override suspend fun doWork(): Result {
+        AppGraph.init(applicationContext)
+        val characterId = inputData.getString("characterId") ?: return Result.success()
+        ChatEngine.wakeReply(characterId)
         return Result.success()
     }
 }

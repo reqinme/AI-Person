@@ -593,7 +593,9 @@ private suspend fun createCharacter(
     identity: String,
     background: String,
     catchphrase: String,
-    memeLevel: Int
+    memeLevel: Int,
+    routine: String,
+    routineDetail: String
 ) {
     val id = UUID.randomUUID().toString()
     AppGraph.db.characterDao().upsert(
@@ -609,20 +611,21 @@ private suspend fun createCharacter(
             identity = identity,
             background = background,
             catchphrase = catchphrase,
-            memeLevel = memeLevel
+            memeLevel = memeLevel,
+            routine = routine,
+            routineDetail = routineDetail
         )
     )
     AppGraph.db.relationshipDao().upsert(RelationshipEntity(characterId = id))
-    // 当前值从底色附近起步，底色本身是之后所有变化的锚点
-    fun around(value: Int) = (value + kotlin.random.Random.nextInt(-3, 4)).coerceIn(0, 100)
+    // 当前值和底色起点完全一致：还没发生任何事，就不该已经有"成长"
     AppGraph.db.personalityDao().upsert(
         PersonalityEntity(
             characterId = id,
-            warmth = around(temperament.warmth),
-            liveliness = around(temperament.liveliness),
-            initiative = around(temperament.initiative),
-            independence = around(temperament.independence),
-            clinginess = around(temperament.clinginess),
+            warmth = temperament.warmth,
+            liveliness = temperament.liveliness,
+            initiative = temperament.initiative,
+            independence = temperament.independence,
+            clinginess = temperament.clinginess,
             prefWarmth = temperament.warmth,
             prefLiveliness = temperament.liveliness,
             prefInitiative = temperament.initiative,
@@ -718,12 +721,12 @@ fun CharacterListScreen(nav: NavHostController) {
         CreateCharacterDialog(
             onDismiss = { showCreate = false },
             onCreate = { name, gender, persona, dislikes, accent, avatar, temperament,
-                         identity, background, catchphrase, memeLevel ->
+                         identity, background, catchphrase, memeLevel, routine, routineDetail ->
                 showCreate = false
                 scope.launch {
                     createCharacter(
                         name, gender, persona, dislikes, accent, avatar, temperament,
-                        identity, background, catchphrase, memeLevel
+                        identity, background, catchphrase, memeLevel, routine, routineDetail
                     )
                 }
             }
@@ -835,7 +838,7 @@ private fun SliderRow(label: String, value: Float, onChange: (Float) -> Unit) {
 private fun CreateCharacterDialog(
     onDismiss: () -> Unit,
     onCreate: (String, String, String, String, Int, String, Temperament,
-               String, String, String, Int) -> Unit
+               String, String, String, Int, String, String) -> Unit
 ) {
     var name by remember { mutableStateOf("") }
     var gender by remember { mutableStateOf("女") }
@@ -849,6 +852,8 @@ private fun CreateCharacterDialog(
     var identity by remember { mutableStateOf("") }
     var background by remember { mutableStateOf("") }
     var catchphrase by remember { mutableStateOf("") }
+    var routine by remember { mutableStateOf("") }
+    var routineDetail by remember { mutableStateOf("") }
     var memeLevel by remember { mutableStateOf(50f) }
     var customBase by remember { mutableStateOf(false) }
     var warmth by remember { mutableStateOf(55f) }
@@ -1005,6 +1010,33 @@ private fun CreateCharacterDialog(
                     modifier = Modifier.fillMaxWidth()
                 )
                 Spacer(Modifier.height(12.dp))
+                Text(
+                    "作息（可留空）",
+                    fontSize = 12.sp,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+                Spacer(Modifier.height(4.dp))
+                Row(
+                    Modifier.horizontalScroll(rememberScrollState()),
+                    horizontalArrangement = Arrangement.spacedBy(6.dp)
+                ) {
+                    Routine.templates.forEach { (id, label) ->
+                        FilterChip(
+                            selected = routine == id,
+                            onClick = { routine = if (routine == id) "" else id },
+                            label = { Text(label, fontSize = 12.sp) }
+                        )
+                    }
+                }
+                Spacer(Modifier.height(6.dp))
+                OutlinedTextField(
+                    value = routineDetail,
+                    onValueChange = { routineDetail = it.take(160) },
+                    label = { Text("她一天怎么过（可留空）") },
+                    placeholder = { Text("比如：周三到周五上午有课，下午在图书馆，晚上回宿舍才看手机") },
+                    modifier = Modifier.fillMaxWidth()
+                )
+                Spacer(Modifier.height(12.dp))
                 OutlinedTextField(
                     value = catchphrase,
                     onValueChange = { catchphrase = it.take(60) },
@@ -1066,7 +1098,8 @@ private fun CreateCharacterDialog(
                     }
                     onCreate(
                         name.trim(), gender, persona.trim(), dislikes.trim(), accent, avatar, chosen,
-                        identity.trim(), background.trim(), catchphrase.trim(), memeLevel.roundToInt()
+                        identity.trim(), background.trim(), catchphrase.trim(), memeLevel.roundToInt(),
+                        routine, routineDetail.trim()
                     )
                 },
                 enabled = name.isNotBlank()
@@ -2236,7 +2269,9 @@ fun CharacterSettingsScreen(nav: NavHostController, characterId: String) {
     var backgroundDraft by remember { mutableStateOf("") }
     var catchphraseDraft by remember { mutableStateOf("") }
     var routineDraft by remember { mutableStateOf("") }
+    var routineDetailDraft by remember { mutableStateOf("") }
     var fillingLife by remember { mutableStateOf(false) }
+    var basicsLoaded by remember { mutableStateOf(false) }
     var memeDraft by remember { mutableFloatStateOf(50f) }
     var intimacyDraft by remember { mutableFloatStateOf(0f) }
     var prefWarmth by remember { mutableFloatStateOf(50f) }
@@ -2268,15 +2303,42 @@ fun CharacterSettingsScreen(nav: NavHostController, characterId: String) {
             backgroundDraft = current.background
             catchphraseDraft = current.catchphrase
             routineDraft = current.routine
+            routineDetailDraft = current.routineDetail
             memeDraft = current.memeLevel.toFloat()
             baseUrl = current.apiBaseUrl
             model = current.apiModel
             vision = current.vision
             apiKey = AppGraph.api.keyFor(characterId)
         }
+        basicsLoaded = true
     }
     LaunchedEffect(relationship?.intimacy) {
         intimacyDraft = (relationship?.intimacy ?: 0).toFloat()
+    }
+    // 基础设定改完就自动保存：不再依赖那个按钮，离开页面也不会丢
+    LaunchedEffect(
+        basicsLoaded,
+        identityDraft,
+        backgroundDraft,
+        catchphraseDraft,
+        routineDraft,
+        routineDetailDraft,
+        memeDraft
+    ) {
+        if (!basicsLoaded) return@LaunchedEffect
+        delay(700)
+        AppGraph.db.characterDao().get(characterId)?.let { saved ->
+            AppGraph.db.characterDao().upsert(
+                saved.copy(
+                    identity = identityDraft.trim(),
+                    background = backgroundDraft.trim(),
+                    catchphrase = catchphraseDraft.trim(),
+                    memeLevel = memeDraft.roundToInt(),
+                    routine = routineDraft,
+                    routineDetail = routineDetailDraft.trim()
+                )
+            )
+        }
     }
 
     // 当前实际人格（会随成长变化），用来展示“底色 + 成长 + 关系”
@@ -2435,17 +2497,22 @@ fun CharacterSettingsScreen(nav: NavHostController, characterId: String) {
                 GlassCard(Modifier.fillMaxWidth(), accent = accent) {
                     Text("她的基础设定", style = MaterialTheme.typography.titleSmall)
                     Spacer(Modifier.height(2.dp))
-                    TextButton(
-                        enabled = !fillingLife && character != null,
-                        onClick = {
-                            val current = character ?: return@TextButton
+                    val fillLifeNow: () -> Unit = {
+                        val current = character
+                        if (!fillingLife && current != null) {
                             fillingLife = true
                             scope.launch {
                                 try {
                                     val raw = withContext(Dispatchers.IO) {
                                         Llm.complete(
                                             current,
-                                            PromptBuilder.fillLife(current),
+                                            PromptBuilder.fillLife(
+                                                current.name,
+                                                current.persona,
+                                                identityDraft,
+                                                backgroundDraft,
+                                                routineDetailDraft
+                                            ),
                                             emptyList()
                                         )
                                     }
@@ -2455,14 +2522,34 @@ fun CharacterSettingsScreen(nav: NavHostController, characterId: String) {
                                         throw IllegalStateException("返回格式不对")
                                     }
                                     val json = JSONObject(raw.substring(start, end + 1))
-                                    json.optString("identity").takeIf { it.isNotBlank() }
-                                        ?.let { identityDraft = it.take(60) }
-                                    json.optString("background").takeIf { it.isNotBlank() }
-                                        ?.let { backgroundDraft = it.take(120) }
+                                    // 用户写了什么就以用户为准，模型只补没写的和细节
+                                    val identity = identityDraft.trim()
+                                        .ifBlank { json.optString("identity").trim() }.take(120)
+                                    val background = backgroundDraft.trim()
+                                        .ifBlank { json.optString("background").trim() }.take(200)
+                                    val detail = routineDetailDraft.trim()
+                                        .ifBlank { json.optString("routineDetail").trim() }.take(160)
                                     val r = json.optString("routine")
-                                    if (Routine.templates.any { it.first == r }) routineDraft = r
-                                    Toast.makeText(context, "补好了，看看再保存", Toast.LENGTH_SHORT)
-                                        .show()
+                                    val routine = routineDraft.ifBlank {
+                                        if (Routine.templates.any { it.first == r }) r else ""
+                                    }
+                                    identityDraft = identity
+                                    backgroundDraft = background
+                                    routineDetailDraft = detail
+                                    routineDraft = routine
+                                    AppGraph.db.characterDao().get(characterId)?.let { saved ->
+                                        AppGraph.db.characterDao().upsert(
+                                            saved.copy(
+                                                identity = identity.trim(),
+                                                background = background.trim(),
+                                                routine = routine,
+                                                routineDetail = detail.trim()
+                                            )
+                                        )
+                                    }
+                                    Toast.makeText(
+                                        context, "补好了，已保存；不满意可以重新生成", Toast.LENGTH_SHORT
+                                    ).show()
                                 } catch (e: Exception) {
                                     Toast.makeText(
                                         context, e.message ?: "补全失败", Toast.LENGTH_SHORT
@@ -2472,13 +2559,33 @@ fun CharacterSettingsScreen(nav: NavHostController, characterId: String) {
                                 }
                             }
                         }
-                    ) {
-                        Text(if (fillingLife) "正在补全…" else "帮她补全生活")
                     }
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Button(
+                            enabled = !fillingLife && character != null,
+                            onClick = fillLifeNow
+                        ) {
+                            Text(if (fillingLife) "正在补全…" else "帮她补全生活")
+                        }
+                        if (identityDraft.isNotBlank() || backgroundDraft.isNotBlank() ||
+                            routineDetailDraft.isNotBlank()
+                        ) {
+                            Spacer(Modifier.width(6.dp))
+                            TextButton(
+                                enabled = !fillingLife && character != null,
+                                onClick = fillLifeNow
+                            ) { Text("重新生成") }
+                        }
+                    }
+                    Text(
+                        "会读你上面已经写的内容，只在那个方向上补；补完会自动保存。",
+                        fontSize = 11.sp,
+                        color = c.muted
+                    )
                     Spacer(Modifier.height(2.dp))
                     OutlinedTextField(
                         value = identityDraft,
-                        onValueChange = { identityDraft = it.take(60) },
+                        onValueChange = { identityDraft = it.take(120) },
                         modifier = Modifier.fillMaxWidth(),
                         label = { Text("她是谁、在做什么") },
                         placeholder = { Text("比如：插画师，一个人住，养了只猫") }
@@ -2486,7 +2593,7 @@ fun CharacterSettingsScreen(nav: NavHostController, characterId: String) {
                     Spacer(Modifier.height(8.dp))
                     OutlinedTextField(
                         value = backgroundDraft,
-                        onValueChange = { backgroundDraft = it.take(120) },
+                        onValueChange = { backgroundDraft = it.take(200) },
                         modifier = Modifier.fillMaxWidth(),
                         label = { Text("她的来历") },
                         placeholder = { Text("比如：小城市长大，大学才来这边，换过两次工作") }
@@ -2523,6 +2630,20 @@ fun CharacterSettingsScreen(nav: NavHostController, characterId: String) {
                         fontSize = 11.sp,
                         color = c.muted
                     )
+                    Spacer(Modifier.height(8.dp))
+                    OutlinedTextField(
+                        value = routineDetailDraft,
+                        onValueChange = { routineDetailDraft = it.take(160) },
+                        modifier = Modifier.fillMaxWidth(),
+                        label = { Text("她一天怎么过（可自己写）") },
+                        placeholder = { Text("比如：周三到周五上午有课，下午在图书馆，晚上回宿舍才看手机") }
+                    )
+                    Spacer(Modifier.height(4.dp))
+                    Text(
+                        "模板只决定大概的作息，这里写她的真实安排，她聊起一天时会照这个说。",
+                        fontSize = 11.sp,
+                        color = c.muted
+                    )
                     Spacer(Modifier.height(6.dp))
                     Row(verticalAlignment = Alignment.CenterVertically) {
                         Text("玩梗程度", fontSize = 12.sp, modifier = Modifier.width(72.dp))
@@ -2556,32 +2677,32 @@ fun CharacterSettingsScreen(nav: NavHostController, characterId: String) {
                         color = c.text
                     )
                     Spacer(Modifier.height(8.dp))
-                    Button(
-                        onClick = {
-                            confirm = ConfirmRequest(
-                                title = "修改她的底线",
-                                body = "这会影响她以后怎么反应，包括什么时候会不高兴、不回你。",
-                                secondBody = "确定把这些写进她的性格里？",
-                                onConfirm = {
-                                    scope.launch {
-                                        AppGraph.db.characterDao().get(characterId)?.let {
-                                            AppGraph.db.characterDao().upsert(
-                                                it.copy(
-                                                    dislikes = dislikesDraft.trim(),
-                                                    identity = identityDraft.trim(),
-                                                    background = backgroundDraft.trim(),
-                                                    catchphrase = catchphraseDraft.trim(),
-                                                    memeLevel = memeDraft.roundToInt(),
-                                                    routine = routineDraft
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Text(
+                            "基础设定会自动保存；底线改动需要确认。",
+                            fontSize = 11.sp,
+                            color = c.muted,
+                            modifier = Modifier.weight(1f)
+                        )
+                        Button(
+                            onClick = {
+                                confirm = ConfirmRequest(
+                                    title = "修改她的底线",
+                                    body = "这会影响她以后怎么反应，包括什么时候会不高兴、不回你。",
+                                    secondBody = "确定把这些写进她的性格里？",
+                                    onConfirm = {
+                                        scope.launch {
+                                            AppGraph.db.characterDao().get(characterId)?.let {
+                                                AppGraph.db.characterDao().upsert(
+                                                    it.copy(dislikes = dislikesDraft.trim())
                                                 )
-                                            )
+                                            }
                                         }
                                     }
-                                }
-                            )
-                        },
-                        modifier = Modifier.align(Alignment.End)
-                    ) { Text("保存") }
+                                )
+                            }
+                        ) { Text("保存底线") }
+                    }
                 }
 
                 Spacer(Modifier.height(12.dp))
@@ -2705,9 +2826,17 @@ fun CharacterSettingsScreen(nav: NavHostController, characterId: String) {
                     Text("这些年", style = MaterialTheme.typography.titleSmall)
                     val narrative = (live?.personaChanges ?: "")
                         .split('\n').map { it.trim() }.filter { it.isNotBlank() }
+                    // 数值动了就说明她确实有点不一样了，文案不能再说"没有变化"
+                    val drifted = live?.let { p ->
+                        p.warmth != p.baseWarmth || p.liveliness != p.baseLiveliness ||
+                            p.initiative != p.baseInitiative ||
+                            p.independence != p.baseIndependence ||
+                            p.clinginess != p.baseClinginess
+                    } == true
                     if (narrative.isEmpty() && personaHistory.isEmpty()) {
                         Text(
-                            "还没有明显的变化。变化很慢，通常要一起过一段时间才看得出来。",
+                            if (drifted) "她比最初有一点点不一样了，只是还没到能说出口的程度。"
+                            else "还没有明显的变化。变化很慢，通常要一起过一段时间才看得出来。",
                             fontSize = 12.sp,
                             color = c.muted
                         )

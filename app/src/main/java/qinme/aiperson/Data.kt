@@ -47,7 +47,9 @@ data class CharacterEntity(
     /** 上面那句心里话是什么时候想的；太久以前的就不当现在用了。 */
     @ColumnInfo(defaultValue = "0") val innerAt: Long = 0L,
     /** 生活作息模板：worker / student / freelance / night / none；空表示没设。 */
-    @ColumnInfo(defaultValue = "''") val routine: String = ""
+    @ColumnInfo(defaultValue = "''") val routine: String = "",
+    /** 她自己怎么过一天，自由描述；模板只决定大概，细节以这里为准。 */
+    @ColumnInfo(defaultValue = "''") val routineDetail: String = ""
 )
 
 /** 聊天记录。visibleAt > 0 表示延迟消息，到点才显示。role 可为 user / assistant / system / note。 */
@@ -444,7 +446,7 @@ interface MoodDao {
         PersonaChangeEntity::class,
         MoodEntity::class
     ],
-    version = 6,
+    version = 8,
     exportSchema = false
 )
 abstract class AppDatabase : RoomDatabase() {
@@ -557,6 +559,13 @@ abstract class AppDatabase : RoomDatabase() {
             }
         }
 
+        /** 7 -> 8：作息可以自由描述，不再被模板框死。 */
+        private val MIGRATION_7_8 = object : Migration(7, 8) {
+            override fun migrate(db: androidx.sqlite.db.SupportSQLiteDatabase) {
+                db.execSQL("ALTER TABLE characters ADD COLUMN routineDetail TEXT NOT NULL DEFAULT ''")
+            }
+        }
+
         fun get(context: Context): AppDatabase = instance ?: synchronized(this) {
             instance ?: Room.databaseBuilder(
                 context.applicationContext,
@@ -564,7 +573,7 @@ abstract class AppDatabase : RoomDatabase() {
                 "ai_person.db"
             ).addMigrations(
                 MIGRATION_1_2, MIGRATION_2_3, MIGRATION_3_4, MIGRATION_4_5,
-                MIGRATION_5_6, MIGRATION_6_7
+                MIGRATION_5_6, MIGRATION_6_7, MIGRATION_7_8
             )
                 .fallbackToDestructiveMigration().build().also { instance = it }
         }

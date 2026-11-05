@@ -15,8 +15,8 @@ android {
         applicationId = "qinme.aiperson"
         minSdk = 26
         targetSdk = 35
-        versionCode = 12
-        versionName = "0.8.0"
+        versionCode = 16
+        versionName = "0.8.4"
     }
 
     // 签名配置放在本地 keystore.properties（已加入 .gitignore），不提交到仓库
